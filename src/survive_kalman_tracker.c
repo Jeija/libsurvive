@@ -282,7 +282,7 @@ void survive_kalman_tracker_integrate_imu(SurviveKalmanTracker *tracker, PoserDa
 
 	FLT rotation_variance[] = {1e5, 1e5, 1e5, 1e5, 1e5, 1e5};
 
-	if (time - tracker->last_light_time > .1) {
+	if (time - tracker->last_observation_time > .05) {
 		// clang-format off
 		SV_CREATE_STACK_MAT(H, 9, tracker->model.state_cnt);
 		sv_set_zero(&H);
@@ -300,6 +300,11 @@ void survive_kalman_tracker_integrate_imu(SurviveKalmanTracker *tracker, PoserDa
 		tracker->stats.imu_total_error += survive_kalman_predict_update_state(time, &tracker->model, &Z, &H, R, false);
 		SV_FREE_STACK_MAT(Z);
 		SV_FREE_STACK_MAT(H);
+
+		SV_INFO("LOST LIGHT SYNCHRONIZATION\n");
+		survive_kalman_tracker_lost_tracking(tracker, false);
+
+		return;
 	}
 
 	struct map_imu_data_ctx fn_ctx = {.tracker = tracker};
@@ -548,6 +553,7 @@ void survive_kalman_tracker_integrate_observation(PoserData *pd, SurviveKalmanTr
 	}
 
 	tracker->last_light_time = time;
+	tracker->last_observation_time = time;
 
 	if (tracker->obs_pos_var >= 0 && tracker->obs_rot_var >= 0) {
 		FLT obs_error = integrate_pose(tracker, time, pose, tracker->adaptive_obs ? 0 : R);
@@ -637,6 +643,7 @@ void survive_kalman_tracker_reinit(SurviveKalmanTracker *tracker) {
 
 	tracker->report_ignore_start_cnt = 0;
 	tracker->last_light_time = 0;
+	tracker->last_observation_time = 0;
 	tracker->light_residuals_all = 0;
 	survive_kalman_state_reset(&tracker->model);
 

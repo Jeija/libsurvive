@@ -194,21 +194,28 @@ static bool invalid_starting_condition(MPFITData *d, size_t meas_size, const siz
 
 	size_t meas_size_known_lh = 0;
 	size_t axis_known_lh = 0;
+	size_t visible_lighthouses = 0;
 	if (meas_for_lhs_axis) {
 		for (uint8_t lh = 0; lh < so->ctx->activeLighthouses; lh++) {
+			bool lighthouse_visible = false;
 			if (so->ctx->bsd[lh].PositionSet) {
 				meas_size_known_lh += meas_for_lhs_axis[2 * lh] + meas_for_lhs_axis[2 * lh + 1];
+				if (meas_for_lhs_axis[2 * lh] + meas_for_lhs_axis[2 * lh + 1] > 0)
+					lighthouse_visible = true;
 				for (int axis = 0; axis < 2; axis++)
 					axis_known_lh += meas_for_lhs_axis[2 * lh + axis] > 0;
 			}
+			visible_lighthouses += lighthouse_visible ? 1 : 0;
 		}
 	} else {
 		meas_size_known_lh = meas_size;
 	}
 
-	if (meas_size_known_lh < d->required_meas || axis_known_lh < 2) {
+	SurviveContext *ctx = so->ctx;
+	SV_INFO("meas_size_known_lh %ld, visible_lighthouses %ld", meas_size_known_lh, visible_lighthouses);
+
+	if (meas_size_known_lh < d->required_meas || axis_known_lh < 2 || visible_lighthouses < 2) {
 		if (failure_count++ == 500) {
-			SurviveContext *ctx = so->ctx;
 			SV_INFO("Can't solve for position with just %u measurements", (unsigned int)meas_size_known_lh);
 			failure_count = 0;
 		}
