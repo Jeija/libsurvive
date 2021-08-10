@@ -409,7 +409,7 @@ void survive_kalman_tracker_integrate_imu(SurviveKalmanTracker *tracker, PoserDa
 
 
 	FLT zvu_var = isStationary ? tracker->zvu_stationary_var : tracker->zvu_moving_var;
-	if (time - tracker->last_light_time > .1) {
+	if (time - tracker->last_observation_time > .1) {
 		zvu_var = tracker->zvu_no_light_var;
 	}
 	if (zvu_var >= 0) {//time - tracker->last_light_time > .1) {//|| isStationary || fabs(1 - norm) < .001 ) {
