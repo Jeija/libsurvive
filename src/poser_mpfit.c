@@ -231,7 +231,7 @@ static bool invalid_starting_condition(MPFITData *d, size_t meas_size, const siz
 	}
 
 	SurviveContext *ctx = so->ctx;
-	SV_INFO("meas_size_known_lh %ld, visible_lighthouses %ld", meas_size_known_lh, visible_lighthouses);
+	//SV_INFO("meas_size_known_lh %ld, visible_lighthouses %ld", meas_size_known_lh, visible_lighthouses);
 
 	if (meas_size_known_lh < d->required_meas || axis_known_lh < 2 || visible_lighthouses < 2) {
 		if (failure_count++ == 500) {

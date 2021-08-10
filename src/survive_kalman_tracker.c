@@ -409,7 +409,7 @@ void survive_kalman_tracker_integrate_imu(SurviveKalmanTracker *tracker, PoserDa
 
 
 	FLT zvu_var = isStationary ? tracker->zvu_stationary_var : tracker->zvu_moving_var;
-	if (time - tracker->last_observation_time > .1) {
+	if (time - tracker->last_light_time > .1) {
 		zvu_var = tracker->zvu_no_light_var;
 	}
 	if (zvu_var >= 0) {//time - tracker->last_light_time > .1) {//|| isStationary || fabs(1 - norm) < .001 ) {
@@ -1003,6 +1003,8 @@ void survive_kalman_tracker_report_state(PoserData *pd, SurviveKalmanTracker *tr
 
 	addnd(tracker->stats.reported_var, var_diag, tracker->stats.reported_var, state_cnt);
 
+	if (var_diag[0] > 1.5e-5 || var_diag[1] > 1.5e-5 || var_diag[2] > 1.5e-5)
+		SV_INFO("Variance: " Point16_format, LINMATH_VEC16_EXPAND(var_diag));
 	SV_VERBOSE(600, "Tracker variance %s " Point16_format, tracker->so->codename, LINMATH_VEC16_EXPAND(var_diag));
 	SV_VERBOSE(600, "Tracker Bias %s     " Point3_format, tracker->so->codename,
 			   LINMATH_VEC3_EXPAND(tracker->state.GyroBias));
