@@ -6,7 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define DEBUG_TB(...) SV_VERBOSE(1000, __VA_ARGS__)
+#define DEBUG_TB(...)                                                                                                  \
+	SV_VERBOSE(((Global_Disambiguator_data_t *)d->so->ctx->disambiguator_data)->verbosity, __VA_ARGS__)
 //#define DEBUG_TB(...)
 /**
  * The lighthouses go in the following order:
@@ -162,7 +163,14 @@ typedef struct {
 	SurviveContext *ctx;
 
 	bool single_60hz_mode;
+	int light_min_length;
+	int verbosity;
 } Global_Disambiguator_data_t;
+
+STRUCT_CONFIG_SECTION(Global_Disambiguator_data_t)
+STRUCT_CONFIG_ITEM("light-min-length", "Minimum length of V1 light to accept.", 100, t->light_min_length);
+STRUCT_CONFIG_ITEM("disambiguator-verbosity", "Verbosity of disambiguator", 1000, t->verbosity);
+END_STRUCT_CONFIG_SECTION(Global_Disambiguator_data_t)
 
 typedef struct {
 	SurviveObject *so;
@@ -555,8 +563,8 @@ static void RunACodeCapture(int target_acode, Disambiguator_data_t *d, const Lig
 	SurviveContext *ctx = d->so->ctx;
 	Global_Disambiguator_data_t *g = ctx->disambiguator_data;
 
-	SV_VERBOSE(500, "Acode Capture %d (%4d) %4d -- %d or %d", target_acode, error, le->length,
-			   ACODE_TIMING(target_acode), ACODE_TIMING(target_acode | DATA_BIT));
+	DEBUG_TB("Acode Capture %d (%4d) %4d -- %d or %d", target_acode, error, le->length, ACODE_TIMING(target_acode),
+			 ACODE_TIMING(target_acode | DATA_BIT));
 	// Errors do happen; either reflections or some other noise. Our scheme here is to
 	// keep a tally of hits and misses, and if we ever go into the negatives reset
 	// the state machine to find the state again.
@@ -612,7 +620,7 @@ static void ProcessStateChange(Disambiguator_data_t *d, const LightcapElement *l
 				SV_WARN("Drift in timecodes %s %u", survive_colorize(d->so->codename), delta);
 			}
 			d->mod_offset[LS_Params[d->state].lh] = new_offset;
-			DEBUG_TB("New offset %d (%d)", new_offset, delta);
+			DEBUG_TB("New offset %2d %d (%d)", LS_Params[d->state].lh, new_offset, delta);
 			// Figure out if it looks more like it has data or doesn't. We need this for OOX
 			int lengthData = ACODE_TIMING(LSParam_acode(d->state) | DATA_BIT);
 			int lengthNoData = ACODE_TIMING(LSParam_acode(d->state));
@@ -647,7 +655,7 @@ static void ProcessStateChange(Disambiguator_data_t *d, const LightcapElement *l
 
 		for (int i = 0; i < d->so->sensor_ct; i++) {
 			LightcapElement le = d->sweep_data[i];
-			if (le.length > 0) {
+			if (le.length > g->light_min_length) {
 				avg_length += le.length;
 				cnt++;
 				// best_timecode = le.timestamp;
@@ -658,19 +666,27 @@ static void ProcessStateChange(Disambiguator_data_t *d, const LightcapElement *l
 			size_t minl = DIV_ROUND_CLOSEST(avg_length, cnt * 4);
 			size_t maxl = var * DIV_ROUND_CLOSEST(avg_length, cnt);
 
+			SurviveObject *so = d->so;
+			FLT avg_length_f = avg_length / cnt, maxl_f = maxl, minl_f = minl;
+			SV_DATA_LOG("sweep[%d][%d].avg", &avg_length_f, 1, lh, LSParam_acode(d->state) & 1);
+			SV_DATA_LOG("sweep[%d][%d].maxl", &maxl_f, 1, lh, LSParam_acode(d->state) & 1);
+			SV_DATA_LOG("sweep[%d][%d].minl", &minl_f, 1, lh, LSParam_acode(d->state) & 1);
+
+			int acode = LSParam_acode(d->state);
 			for (int i = 0; i < d->so->sensor_ct; i++) {
 				const LightcapElement *le = &d->sweep_data[i];
 				// Only care if we actually have data AND we have a time of last sync. We won't have the latter
 				// if we synced with the LH at certain times.
 				if (le->length > 0 && le->length >= minl && le->length <= maxl) {
 					int le_offset = apply_mod_offset(le->timestamp + le->length / 2, d->mod_offset[lh], end_of_mod);
-					int32_t offset_from = le_offset - LSParam_offset_for_state(d->state) + (lh == 0 ? 20000 : 40000);
+					int32_t offset_from = le_offset - LSParam_offset_for_state(d->state - 1 - lh);
+					//					if(acode & 1)
+					//						offset_from += 20000;
 
 					assert(offset_from > 0);
 					// Send the lightburst out.
 					if (d->confidence > 80) {
-						SURVIVE_INVOKE_HOOK_SO(light, d->so, i, LSParam_acode(d->state), offset_from, le->timestamp,
-											   le->length, lh);
+						SURVIVE_INVOKE_HOOK_SO(light, d->so, i, acode, offset_from, le->timestamp, le->length, lh);
 						d->stats.sweep_hit_count++;
 					} else {
 						d->stats.drop_sweeps++;
@@ -729,7 +745,7 @@ static void PropagateState(Disambiguator_data_t *d, const LightcapElement *le) {
 	if (param->is_sweep == 0) {
 		RunACodeCapture(LSParam_acode(d->state), d, le);
 	} else if (le->length > d->sweep_data[le->sensor_id].length &&
-			   le->length < 7000 /*anything above 10k seems to be bullshit?*/) {
+			   le->length < 10000 /*anything above 10k seems to be bullshit?*/) {
 		// Note we only select the highest length one per sweep. Also, we bundle everything up and send it later all at
 		// once.
 		// so that we can do this filtering. Might not be necessary?
@@ -758,6 +774,7 @@ void DisambiguatorStateBased(SurviveObject *so, const LightcapElement *le) {
 				SV_VERBOSE(5, "\tdrop_syncs[%d]           %u", i, d->stats.drop_syncs[i]);
 			}
 		}
+		Global_Disambiguator_data_t_detach_config(ctx, ctx->disambiguator_data);
 		free(ctx->disambiguator_data);
 		ctx->disambiguator_data = 0;
 
@@ -776,14 +793,13 @@ void DisambiguatorStateBased(SurviveObject *so, const LightcapElement *le) {
 	}
 
 	if (so->ctx->disambiguator_data == NULL) {
-		DEBUG_TB("Initializing Global Disambiguator Data");
 		Global_Disambiguator_data_t *d = SV_CALLOC(sizeof(Global_Disambiguator_data_t));
 		d->ctx = ctx;
 		ctx->disambiguator_data = d;
+		Global_Disambiguator_data_t_attach_config(ctx, d);
 	}
 
 	if (so->disambiguator_data == NULL) {
-		DEBUG_TB("Initializing Disambiguator Data for TB %d", so->sensor_ct);
 		Disambiguator_data_t *d = SV_CALLOC(sizeof(Disambiguator_data_t) + sizeof(LightcapElement) * so->sensor_ct);
 		d->so = so;
 		so->disambiguator_data = d;

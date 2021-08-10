@@ -12,6 +12,21 @@
 extern "C" {
 #endif
 
+typedef PoserDataGlobalSceneMeasurement LightInfo;
+
+struct pid_t {
+	FLT err;
+	FLT integration;
+
+	FLT Kp, Ki, Kd;
+};
+
+struct SurviveKalmanTracker_Params {
+	FLT process_weight_acc, process_weight_vel, process_weight_pos;
+	FLT process_weight_ang_velocity, process_weight_rotation;
+	FLT process_weight_acc_bias;
+	FLT process_weight_gyro_bias;
+};
 /**
  * The kalman model as it pertains to LH tracking has a state space like so:
  *
@@ -31,6 +46,7 @@ extern "C" {
 typedef struct SurviveKalmanTracker {
 	SurviveObject *so;
 
+	FLT acc_norm_penalty;
 	FLT acc_var;
 	FLT gyro_var;
 	FLT obs_pos_var;
@@ -38,28 +54,30 @@ typedef struct SurviveKalmanTracker {
 	FLT light_var;
 
 	FLT last_observation_time;
+	int light_batchsize;
 	FLT last_light_time, last_report_time, first_report_time;
 	FLT first_imu_time, last_imu_time;
 	FLT min_report_time;
 
-	bool model_gyro_bias;
-	bool model_accel;
-	bool use_raw_obs;
-	int adaptive_imu, adaptive_lightcap, adaptive_obs;
+	int use_raw_obs;
+	int adaptive_imu, adaptive_lightcap, adaptive_obs, show_raw_obs;
 
 	FLT light_threshold_var, report_threshold_var, light_error_threshold;
+	FLT zvu_stationary_var;
+	FLT zvu_no_light_var;
+	FLT zvu_moving_var;
 	int32_t light_required_obs;
 	int32_t report_ignore_start;
 	int32_t report_ignore_start_cnt;
 
-	FLT process_weight_acc, process_weight_vel, process_weight_pos;
-	FLT process_weight_ang_velocity, process_weight_rotation;
+	struct SurviveKalmanTracker_Params params;
 
 	FLT moving_acc_scale, stationary_acc_scale;
 
 	// Kalman state is layed out as SurviveKalmanModel
-	SurviveKalmanModel state;
 	survive_kalman_state_t model;
+
+	const char* datalog_tag;
 
 	struct {
 		uint32_t late_imu_dropped;
@@ -89,10 +107,17 @@ typedef struct SurviveKalmanTracker {
 	FLT IMU_R[6 * 6];
 	FLT Lightcap_R;
 
+	struct pid_t acc_scale_control;
 	FLT acc_scale;
+	FLT acc_bias[3];
 
-	size_t light_rampin_length;
-	bool use_error_for_lh_pos;
+	int light_rampin_length;
+	int use_error_for_lh_pos;
+
+	LightInfo savedLight[32];
+	uint32_t savedLight_idx;
+
+	SurviveKalmanModel state;
 } SurviveKalmanTracker;
 
 SURVIVE_EXPORT SurviveVelocity survive_kalman_tracker_velocity(const SurviveKalmanTracker *tracker);
@@ -106,6 +131,12 @@ SURVIVE_EXPORT void survive_kalman_tracker_integrate_observation(PoserData *pd, 
 																 const SurvivePose *pose, const FLT *variance);
 SURVIVE_EXPORT void survive_kalman_tracker_report_state(PoserData *pd, SurviveKalmanTracker *tracker);
 SURVIVE_EXPORT void survive_kalman_tracker_lost_tracking(SurviveKalmanTracker *tracker, bool allowLHReset);
+
+SURVIVE_EXPORT void survive_kalman_tracker_model_predict(FLT t, const survive_kalman_state_t *k, const SvMat *f_in, SvMat *f_out);
+SURVIVE_EXPORT void survive_kalman_tracker_predict_jac(FLT t, struct SvMat *f_out, const struct SvMat *x0);
+SURVIVE_EXPORT void survive_kalman_tracker_process_noise(const struct SurviveKalmanTracker_Params* params, FLT t, const SvMat *x, struct SvMat *q_out);
+SURVIVE_EXPORT bool survive_kalman_tracker_imu_measurement_model(void *user, const struct SvMat *Z, const struct SvMat *x_t, struct SvMat *y,
+												  struct SvMat *H_k);
 #ifdef __cplusplus
 };
 #endif

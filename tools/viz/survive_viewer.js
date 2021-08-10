@@ -2,6 +2,7 @@ var objs = {};
 var visible_tolerance = 1608200 * 2;
 var downAxes = {};
 var angles = {};
+var rp_angles = {};
 var ctx;
 var canvas;
 var oldDrawTime = 0;
@@ -119,8 +120,6 @@ function add_lighthouse(idx, p, q) {
 	scene.add(group);
 }
 
-function run_planes() {}
-
 function get_bvalue(key) {
 	var bvalue_array = {"WW0" : "FF", "TR0" : "00"};
 	var bvalue = bvalue_array[key];
@@ -219,9 +218,20 @@ function redrawCanvas(when) {
 	}
 
 	ctx.strokeStyle = "#ffffff";
-	ctx.beginPath();
+
 	for (var x = -fov_degrees; x < fov_degrees; x += 10) {
-		var length = Math.abs(x) == 60 ? canvas.width : 10;
+		var length = 10;
+		ctx.beginPath();
+		ctx.setLineDash([])
+		if (Math.abs(x) === 60) {
+			length = canvas.width;
+			ctx.setLineDash([ 5, 15 ])
+		}
+		else if (Math.abs(x) === 0) {
+			length = canvas.width;
+			ctx.setLineDash([ 1, 15 ])
+		}
+
 		ctx.moveTo(rad_to_x(x / 180 * Math.PI), 0);
 		ctx.lineTo(rad_to_x(x / 180 * Math.PI), length);
 
@@ -233,9 +243,8 @@ function redrawCanvas(when) {
 
 		ctx.moveTo(canvas.width, rad_to_x(x / 180 * Math.PI));
 		ctx.lineTo(canvas.width - length, rad_to_x(x / 180 * Math.PI));
+		ctx.stroke();
 	}
-
-	ctx.stroke();
 
 	for (var key in angles) {
 		for (var lh = 0; lh < 16; lh++) {
@@ -268,6 +277,26 @@ function redrawCanvas(when) {
 					ctx.beginPath();
 					ctx.arc(x, y, 1, 0, 2 * Math.PI);
 					ctx.stroke();
+
+					const rp = get_rp_angles(key, lh, id)
+					const rpx = rp[0], rpy = rp[1];
+					if (isFinite(rpx + rpy)) {
+						scale = 10;
+						var rx = rad_to_x(rpx * scale + ang[0][0])
+						var ry = rad_to_y(rpy * scale + ang[1][0])
+
+						dx = rx;
+						dy = ry;
+
+						ctx.fillStyle = "white";
+						ctx.font = "14px Arial";
+
+						ctx.strokeStyle = "#" + lhColors[lh].toString(16);
+						ctx.beginPath();
+						ctx.moveTo(x, y);
+						ctx.lineTo(dx, dy);
+						ctx.stroke();
+					}
 				}
 		}
 	}
@@ -463,6 +492,27 @@ $(function() { $("#imu").change(update_show_imu); });
 function update_fpv() { useFPV = this.checked; }
 $(function() { $("#fpv").change(update_fpv); });
 
+function set_object_position(obj, name = null) {
+	var objr = objs[name ?? obj.tracker];
+
+	objr.group.position.set(obj.position[0], obj.position[1], obj.position[2]);
+	objr.group_rot.quaternion.set(obj.quat[1], obj.quat[2], obj.quat[3], obj.quat[0]);
+	objr.group.verticesNeedUpdate = true;
+	objr.group_rot.verticesNeedUpdate = true;
+
+	if ("HMD" === obj.tracker || "T20" == obj.tracker) {
+		var up = new THREE.Vector3(0, 1, 0);
+		var out = new THREE.Vector3(0, 0, -1);
+
+		fpv_camera.up = up.applyQuaternion(objr.group_rot.quaternion);
+		var lookAt = out.applyQuaternion(objr.group_rot.quaternion);
+		lookAt.add(objr.position);
+
+		fpv_camera.position.set(obj.position[0], obj.position[1], obj.position[2]);
+		fpv_camera.lookAt(lookAt);
+	}
+}
+
 function update_velocity(v) {
 	var obj = {
 		tracker : v[1],
@@ -507,10 +557,7 @@ function update_object(v, allow_unsetup, external) {
 		}
 		objr.poseCnt++;
 
-		objr.group.position.set(obj.position[0], obj.position[1], obj.position[2]);
-		objr.group_rot.quaternion.set(obj.quat[1], obj.quat[2], obj.quat[3], obj.quat[0]);
-		objr.group.verticesNeedUpdate = true;
-		objr.group_rot.verticesNeedUpdate = true;
+		set_object_position(obj);
 
 		if (objr.sensorref)
 			objr.sensorref.visible = showModel;
@@ -534,33 +581,26 @@ function update_object(v, allow_unsetup, external) {
 			record_position(obj.tracker, time, obj);
 		}
 
-		if ("HMD" === obj.tracker || "T20" == obj.tracker) {
-			var up = new THREE.Vector3(0, 1, 0);
-			var out = new THREE.Vector3(0, 0, -1);
-
-			fpv_camera.up = up.applyQuaternion(objr.group_rot.quaternion);
-			var lookAt = out.applyQuaternion(objr.group_rot.quaternion);
-			lookAt.add(objr.position);
-
-			fpv_camera.position.set(obj.position[0], obj.position[1], obj.position[2]);
-			fpv_camera.lookAt(lookAt);
-		}
 	}
 }
 
 var position_history = {};
 var max_time = 0;
 function record_position(name, time, position) {
+	if (isNaN(time))
+		return;
+
 	max_time = Math.max(max_time, time);
-	if (position_history[name] == undefined)
-		position_history[name] = [];
+	$("#time")[0].max = max_time
+	if (position_history[name] === undefined)
+	position_history[name] = [];
 	position_history[name].push({time : time, position : position});
 }
 
 $(function() {
 	tooltip = $("#tooltip");
-	$("#time").on('change mousemove', function(event, ui) {
-		var time = $("#time").val() * max_time / 100.;
+	$("#time").on('change', function(event, ui) {
+		var time = $("#time").val()
 
 		var names = Object.keys(position_history);
 		for (var i = 0; i < names.length; i++) {
@@ -571,9 +611,7 @@ $(function() {
 				;
 
 			var obj = position_history[name][j].position;
-			objs[name].position.set(obj.position[0], obj.position[1], obj.position[2]);
-			objs[name].quaternion.set(obj.quat[1], obj.quat[2], obj.quat[3], obj.quat[0]);
-			objs[name].verticesNeedUpdate = true;
+			set_object_position(obj, name);
 		}
 	});
 });
@@ -594,11 +632,14 @@ var polys = {};
 function add_sphere(v) {
 	var fv = v.map(parseFloat);
 
-	var geometry = new THREE.SphereGeometry(fv[3], 4, 4);
 	var name = v[2];
 
 	scene.remove(polys[name]);
 
+	if (fv[3] <= 1e-5)
+		return;
+
+	var geometry = new THREE.SphereGeometry(fv[3], 4, 4);
 	var material =
 		new THREE.MeshBasicMaterial({color : fv[4], opacity : .5, transparent : true, side : THREE.DoubleSide});
 
@@ -608,6 +649,13 @@ function add_sphere(v) {
 	polys[name] = mesh;
 
 	scene.add(mesh);
+}
+
+function get_rp_angles(tracker, lighthouse, sensor_id) {
+	rp_angles[tracker] = rp_angles[tracker] || {};
+	rp_angles[tracker][lighthouse] = rp_angles[tracker][lighthouse] || {};
+	rp_angles[tracker][lighthouse][sensor_id] = rp_angles[tracker][lighthouse][sensor_id] || {};
+	return rp_angles[tracker][lighthouse][sensor_id]
 }
 
 function add_poly(v) {
@@ -721,6 +769,17 @@ var survive_log_handlers = {
 
 		angles[obj.tracker][obj.lighthouse][obj.sensor_id][obj.acode & 1] = [ obj.angle, obj.timecode ];
 		timecode[obj.tracker] = obj.timecode;
+	},
+	"RA" : function add_reproject_angle(v, tracker) {
+		var obj = {
+			tracker : v[1],
+			sensor_id : parseInt(v[3]),
+			axis : parseInt(v[4]),
+			angle : parseFloat(v[5]),
+			lighthouse : parseInt(v[6]),
+		};
+
+		get_rp_angles(obj.tracker, obj.lighthouse, obj.sensor_id)[obj.axis] = obj.angle;
 	},
 	'LOG' : function(v) {
 		var msg = v.slice(3).join(' ');
@@ -855,7 +914,7 @@ function init() {
 	camera = new THREE.PerspectiveCamera(VIEW_ANGLE, ASPECT, NEAR, FAR);
 	camera.up = new THREE.Vector3(0, 0, 1);
 
-	fpv_camera = new THREE.PerspectiveCamera(VIEW_ANGLE, ASPECT, .1, FAR);
+	fpv_camera = new THREE.PerspectiveCamera(VIEW_ANGLE * 2, ASPECT, .1, FAR);
 	scene.add(fpv_camera);
 
 	// add the camera to the scene

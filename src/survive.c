@@ -15,6 +15,7 @@
 #include "os_generic.h"
 #include "survive_config.h"
 #include "survive_default_devices.h"
+#include "survive_kalman_lighthouses.h"
 #include "survive_recording.h"
 
 #include <stdarg.h>
@@ -41,7 +42,7 @@ STATIC_CONFIG_ITEM(LIGHTHOUSE_GEN, "lighthouse-gen", 'i',
 				   "Which lighthouse gen to use -- 1 for LH1, 2 for LH2, 0 (default) for auto-detect", 0)
 STATIC_CONFIG_ITEM(OUTPUT_CALLBACK_STATS, "output-callback-stats", 'f',
 				   "Print cb stats every given number of seconds. 0 disables this output.", 0.);
-STATIC_CONFIG_ITEM(THREADED_POSERS, "threaded-posers", 'i', "Whether or not to run each poser in their own thread.", 1)
+STATIC_CONFIG_ITEM(THREADED_POSERS, "threaded-posers", 'i', "Whether or not to run each poser in their own thread.", 0)
 
 const char *survive_config_file_name(struct SurviveContext *ctx) {
 	return survive_configs(ctx, "configfile", SC_GET, DEFAULT_CONFIG_PATH);
@@ -213,7 +214,7 @@ SURVIVE_EXPORT int8_t survive_get_bsd_idx(SurviveContext *ctx, survive_channel c
 
 	if (ctx->lh_version == 0) {
 		if (ctx->bsd[channel].mode == 0xFF) {
-			ctx->bsd[channel] = (BaseStationData){0};
+			ctx->bsd[channel] = (BaseStationData){.tracker = ctx->bsd[channel].tracker};
 			ctx->bsd[channel].mode = channel;
 			ctx->activeLighthouses++;
 			SV_INFO("Adding lighthouse ch %d (cnt: %d)", channel, ctx->activeLighthouses);
@@ -227,7 +228,7 @@ SURVIVE_EXPORT int8_t survive_get_bsd_idx(SurviveContext *ctx, survive_channel c
 
 	for (i = 0; i < NUM_GEN2_LIGHTHOUSES; i++) {
 		if (ctx->bsd[i].mode == 0xFF) {
-			ctx->bsd[i] = (BaseStationData){0};
+			ctx->bsd[i] = (BaseStationData){.tracker = ctx->bsd[i].tracker};
 			ctx->bsd[i].mode = channel;
 			if (ctx->activeLighthouses < i + 1) {
 				ctx->activeLighthouses = i + 1;
@@ -433,6 +434,11 @@ SurviveContext *survive_init_internal(int argc, char *const *argv, void *userDat
 	SV_VERBOSE(5, "libsurvive version %s", survive_build_tag());
 	SV_VERBOSE(5, "Config file is %.512s", config_path);
 
+	SV_VERBOSE(100, "Args: ");
+	for(int i = 0;i < argc;i++) {
+		SV_VERBOSE(100, "\t'%s'",argv[i]);
+	}
+
 	const char *record_config_prefix_fields[] = {"record", "usbmon-record", 0};
 	if (!user_set_configfile && find_correct_config_file(ctx, record_config_prefix_fields)) {
 		survive_config_file_path(ctx, config_path);
@@ -455,7 +461,15 @@ SurviveContext *survive_init_internal(int argc, char *const *argv, void *userDat
 			ctx->activeLighthouses++;
 			SV_VERBOSE(50, "Adding LH %d mode: %d id: %08x", i, ctx->bsd[i].mode, (unsigned)ctx->bsd[i].BaseStationID);
 		}
-	}
+		char buffer[128] = {0};
+		sprintf(buffer, "lighthouse-%d-disable", i);
+		if (ctx->bsd[i].disable = survive_configi(ctx, buffer, SC_GET, 0)) {
+			SV_WARN("Disabling LH %d", i);
+		}
+
+		ctx->bsd[i].tracker = SV_MALLOC(sizeof(struct SurviveKalmanLighthouse));
+		survive_kalman_lighthouse_init(ctx->bsd[i].tracker, ctx, i);
+	};
 
 	if( list_for_autocomplete )
 	{
@@ -538,7 +552,7 @@ survive_driver_fn GetDriverByConfig(SurviveContext *ctx, const char *name, const
 		}
 	}
 	if (!func) {
-		SV_ERROR(SURVIVE_ERROR_INVALID_CONFIG, "Error.  Cannot find any valid %s.", name);
+		SV_WARN("Error.  Cannot find any valid %s.", name);
 		return 0;
 	}
 
@@ -667,6 +681,26 @@ int survive_startup(SurviveContext *ctx) {
 		}
 	}
 
+	int ootxuse = survive_configi(ctx, "use-ootx", SC_GET, 1);
+	if (!ootxuse) {
+		for (int i = 0; i < ctx->activeLighthouses; i++) {
+			memset(ctx->bsd[i].fcal, 0, sizeof(ctx->bsd[i].fcal));
+		}
+	}
+
+	const char *steamvr_path = survive_configs(ctx, "steamvr-calibration", SC_GET, "");
+	if (steamvr_path == 0 || steamvr_path[0] != 0) {
+		char configpath[1024] = {0};
+		if (steamvr_path == 0) {
+			const char *home = getenv("HOME");
+			snprintf(configpath, sizeof(configpath) - 1, "%s/.steam/steam/config/lighthouse/lighthousedb.json", home);
+			steamvr_path = configpath;
+		}
+		SV_VERBOSE(10, "Attempting to load lighthouse db from %s", steamvr_path);
+		survive_load_steamvr_lighthousedb_from_file(ctx, steamvr_path);
+		config_save(ctx);
+	}
+
 	// If lighthouse positions are known, broadcast them
 	for (int i = 0; i < ctx->activeLighthouses; i++) {
 		if (ctx->bsd[i].PositionSet) {
@@ -763,11 +797,15 @@ const void *survive_get_driver_by_closefn(const SurviveContext *ctx, DeviceDrive
 	return 0;
 }
 
+void survive_reset_lighthouse_position(SurviveContext *ctx, int bsd_idx) {
+	ctx->bsd[bsd_idx].PositionSet = false;
+}
+
 void survive_reset_lighthouse_positions(SurviveContext *ctx) {
 	// survive_get_ctx_lock(ctx);
 	SV_VERBOSE(100, "survive_reset_lighthouse_positions called");
 	for (int i = 0; i < ctx->activeLighthouses; i++) {
-		ctx->bsd[i].PositionSet = false;
+		survive_reset_lighthouse_position(ctx, i);
 	}
 	for (int i = 0; i < ctx->objs_ct; i++) {
 		survive_kalman_tracker_lost_tracking(ctx->objs[i]->tracker, false);
@@ -895,6 +933,8 @@ void survive_close(SurviveContext *ctx) {
 
 	for (int i = 0; i < NUM_GEN2_LIGHTHOUSES; i++) {
 		survive_ootx_free_decoder_context(ctx, i);
+		survive_kalman_lighthouse_free(ctx->bsd[i].tracker);
+		ctx->bsd[i].tracker = 0;
 	}
 
 	survive_output_callback_stats(ctx);

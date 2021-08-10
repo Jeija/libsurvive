@@ -32,7 +32,7 @@ def get_times(d):
 
 
 def get_data(d):
-    return np.array([x[1] for x in d])
+    return np.array(d)[:, 1:]
 
 
 def figsize_or_default(figsize):
@@ -60,6 +60,9 @@ class RecordedData:
         self.time_since_move = []
         self.poses = []
         self.velocities = []
+        self.raw_gyros = []
+        self.raw_accels = []
+        self.raw_imu_times = []
         self.raw_angles = defaultdict(list)
         self.datalogs = defaultdict(list)
 
@@ -69,6 +72,11 @@ class RecordedData:
         self.accels.append(accelgyro[0:3])
         self.time_since_move.append(pysurvive.SurviveSensorActivations_stationary_time(self.so.contents.activations) /
                                     48000000.)
+
+    def record_raw_imu(self, time, mode, accelgyro, timecode, id):
+        self.raw_imu_times.append(time)
+        self.raw_gyros.append(accelgyro[3:6])
+        self.raw_accels.append(accelgyro[0:3])
 
     def record_pose(self, time, timecode, pose):
         self.poses.append((time, pose))
@@ -89,7 +97,7 @@ class RecordedData:
         self.angles[key].append([time, angle])
 
     def record_datalog(self, time, name, values):
-        self.datalogs[str(name)].append([time, values])
+        self.datalogs[str(name)].append([time, *values])
 
     def record_angle(self, time, sensor_id, acode, timecode, length, angle, lh):
         key = (sensor_id, lh, acode & 1)
@@ -194,7 +202,7 @@ class RecordedData:
             ax.plot(get_times(accel_running_avg), get_data(accel_running_avg)[:, i], label="Avg" + axes_name[i])
         ax.legend()
 
-    def plot_datalog(self, prefix="", fig=None, plot_num=1, plot_rows=1, plot_cols=1, figsize=None, *args, **kwargs):
+    def plot_datalog(self, prefix="", fig=None, plot_num=1, plot_rows=1, plot_cols=1, figsize=None, start_idx = None, end_idx = None, linestyle='-', legend=True, *args, **kwargs):
         if fig is None:
             fig = plt.figure(figsize=figsize_or_default(figsize))
         ax = fig.add_subplot(plot_rows, plot_cols, plot_num, title=prefix)
@@ -202,10 +210,12 @@ class RecordedData:
         keys = [k for k in self.datalogs.keys() if k.startswith(prefix)]
         for k in keys:
             times = get_times(self.datalogs[k])
-            data = get_data(self.datalogs[k])
-
-            ax.plot(times, data, '-', linewidth=1, ms=1, label=k)
-        ax.legend()
+            data = get_data(self.datalogs[k])[:,start_idx:end_idx]
+            for idx in range(0, data.shape[1]):
+                label = k + "[" + str(idx + (start_idx if start_idx is not None else 0)) + "]"
+                ax.plot(times, data[:,idx], linestyle, linewidth=1, ms=1, label=label)
+        if legend:
+            ax.legend()
         fig.tight_layout()
 
     def plot_gyro(self, fig=None, plot_num=1, plot_rows=1, plot_cols=1, figsize=None, *args, **kwargs):
@@ -292,13 +302,13 @@ class RecordedData:
         ax.legend()
         return 1
 
-    def plot_light_angles(self, fig=None, plot_num=1, plot_rows=1, plot_cols=1, figsize=None, plot_all_light=False,
+    def plot_light_angles(self, fig=None, plot_num=1, plot_rows=1, plot_cols=1, figsize=None, linestyle='.', plot_all_light=False,
                           **kwargs):
         if len(self.angles) == 0:
             return 0
 
         if fig is None:
-            fig = plt.figure()
+            fig = plt.figure(figsize=figsize_or_default(figsize))
 
         def pv(tv):
             time, values = tv
@@ -315,7 +325,7 @@ class RecordedData:
         for k, v in self.angles.items():
             vv = np.array(v)
             if vv.shape[0] > 10:
-                ax.plot(vv[:, 0], vv[:, 1], '.', label=k, linewidth=1)
+                ax.plot(vv[:, 0], vv[:, 1], linestyle, label=k, linewidth=1)
         # ax.legend(ncol=4)
 
         return 1
@@ -440,6 +450,7 @@ def install(ctx):
     pysurvive.install_angle_fn(ctx, partial(cb_fn, RecordedData.record_angle))
     pysurvive.install_light_fn(ctx, partial(cb_fn, RecordedData.record_light))
     pysurvive.install_imu_fn(ctx, partial(cb_fn, RecordedData.record_imu))
+    pysurvive.install_raw_imu_fn(ctx, partial(cb_fn, RecordedData.record_raw_imu))
     pysurvive.install_pose_fn(ctx, partial(cb_fn, RecordedData.record_pose))
     pysurvive.install_velocity_fn(ctx, partial(cb_fn, RecordedData.record_velocity))
     pysurvive.install_sweep_fn(ctx, partial(cb_fn, RecordedData.record_sweep))

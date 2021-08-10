@@ -22,7 +22,7 @@ SurviveObject *survive_create_device(SurviveContext *ctx, const char *driver_nam
 
 	memcpy(device->drivername, driver_name, strlen(driver_name));
 	memcpy(device->codename, device_name, strlen(device_name));
-	for (int i = 0; i < ctx->objs_ct; i++) {
+	for (int i = 0; ctx && i < ctx->objs_ct; i++) {
 		if (memcmp(device->codename, ctx->objs[i]->codename, sizeof(driver_name)) == 0) {
 			i = 0;
 			device->codename[2]++;
@@ -432,7 +432,7 @@ int survive_load_htc_config_format(SurviveObject *so, char *ct0conf, int len) {
 			so->sensor_locations[j * 3 + 0] *= 1.0;
 		}
 
-	} else // Verified on WW, Need to verify on Tracker.
+	} else // Verified on WW, Tracker, both RF and wired
 	{
 		// 1G for accelerometer, from MPU6500 datasheet
 		// this can change if the firmware changes the sensitivity.
@@ -451,6 +451,144 @@ int survive_load_htc_config_format(SurviveObject *so, char *ct0conf, int len) {
 	SV_VERBOSE(50, "Read config for %s", survive_colorize(so->codename));
 	jsmn_free(&p);
 	return 0;
+}
+
+struct lhdb_ctx {
+	SurviveContext *ctx;
+	uint32_t lh_found;
+	uint32_t serials[NUM_GEN2_LIGHTHOUSES];
+
+	SurvivePose poses[NUM_GEN2_LIGHTHOUSES];
+
+	struct json_stack_entry_s *parsingBSD;
+	FLT pitch, roll;
+};
+static void lhdb_begin_object(struct json_callbacks *cb, struct json_stack_entry_s *obj) {
+	struct lhdb_ctx *lhdb = cb->user;
+
+	if (!lhdb->parsingBSD && json_has_ancestor_tag("base_stations", obj) &&
+		json_has_ancestor_tag("known_universes", obj)) {
+		lhdb->parsingBSD = obj;
+		lhdb->lh_found++;
+		SurviveContext *ctx = lhdb->ctx;
+		SV_VERBOSE(105, "Found base station object definition");
+	}
+}
+static void lhdb_end_object(struct json_callbacks *cb, struct json_stack_entry_s *obj) {
+	struct lhdb_ctx *lhdb = cb->user;
+
+	if (obj && obj == lhdb->parsingBSD) {
+		lhdb->parsingBSD = 0;
+		SurviveContext *ctx = lhdb->ctx;
+		SV_VERBOSE(105, "Exiting base station object definition");
+	}
+}
+static void lhdb_tag_value(struct json_callbacks *cb, struct json_stack_entry_s *obj) {
+	struct lhdb_ctx *lhdb = cb->user;
+	SurviveContext *ctx = lhdb->ctx;
+
+	if (strcmp("base_serial_number", json_stack_tag(obj)) == 0) {
+		lhdb->serials[lhdb->lh_found - 1] = atoi(json_stack_value(obj));
+		SV_VERBOSE(105, "\tSerial number %8u", lhdb->serials[lhdb->lh_found - 1]);
+	} else if (json_has_ancestor_tag("pose", obj)) {
+		FLT v = atof(json_stack_value(obj));
+		int idx = json_stack_index(obj);
+		if (idx >= 4) {
+			lhdb->poses[lhdb->lh_found - 1].Pos[idx - 4] = v;
+		} else if (idx <= 2) {
+			lhdb->poses[lhdb->lh_found - 1].Rot[idx + 1] = v;
+		} else {
+			lhdb->poses[lhdb->lh_found - 1].Rot[0] = v;
+		}
+		SV_VERBOSE(105, "\tPose index %d %f", idx, v);
+	} else if (strcmp("pitch", json_stack_tag(obj)) == 0 && json_has_ancestor_tag("known_universes", obj)) {
+		lhdb->pitch = atof(json_stack_value(obj));
+	} else if (strcmp("roll", json_stack_tag(obj)) == 0 && json_has_ancestor_tag("known_universes", obj)) {
+		lhdb->roll = atof(json_stack_value(obj));
+	}
+}
+
+SURVIVE_EXPORT int survive_load_steamvr_lighthousedb(SurviveContext *ctx, char *ct0conf, int len) {
+	if (len == 0)
+		return -1;
+
+	jsmn_parser p = {0};
+	jsmn_init(&p);
+
+	int r = jsmn_parse(&p, ct0conf, len);
+	if (r < 0) {
+		SV_WARN("Failed to parse JSON in lighthouse db: %d\n", r);
+		jsmn_free(&p);
+		return -1;
+	}
+	struct lhdb_ctx lhctx = {.ctx = ctx};
+	struct json_callbacks cbs = {.user = &lhctx,
+								 .json_begin_object = lhdb_begin_object,
+								 .json_end_object = lhdb_end_object,
+								 .json_tag_value = lhdb_tag_value};
+	json_run_callbacks(&cbs, ct0conf, len);
+
+	FLT euler[] = {lhctx.roll, lhctx.pitch, 0};
+	LinmathPose vr2bsd = {0, .Rot = {1}};
+	// quatfromeuler(vr2bsd.Rot, euler);
+
+	LinmathQuat q = {1};
+	LinmathPoint3d survivePts[] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+	LinmathPoint3d openvrPts[] = {{1, 0, 0}, {0, 0, -1}, {0, 1, 0}};
+	// KabschCentered(q, (FLT *)openvrPts, (FLT *)survivePts, 3);
+	quatrotateabout(vr2bsd.Rot, q, vr2bsd.Rot);
+	SurvivePose bsdup2realup = {.Rot = {0.}};
+
+	for (int i = 0; i < ctx->activeLighthouses; i++) {
+		for (int j = 0; j < lhctx.lh_found; j++) {
+			if (ctx->bsd[i].BaseStationID == lhctx.serials[j]) {
+				lhctx.poses[j] = InvertPoseRtn(&lhctx.poses[j]);
+				SV_VERBOSE(50, "Basestation ID %8u (%d) has " SurvivePose_format, lhctx.serials[j], i,
+						   SURVIVE_POSE_EXPAND(lhctx.poses[j]));
+				ApplyPoseToPose(&ctx->bsd[i].Pose, &vr2bsd, &lhctx.poses[j]);
+
+				if (quatiszero(bsdup2realup.Rot)) {
+					LinmathPoint3d real_up = {0, 0, 1};
+					LinmathPoint3d bsd_up = {0};
+					normalize3d(bsd_up, ctx->bsd[i].accel);
+					quatrotatevector(bsd_up, ctx->bsd[i].Pose.Rot, bsd_up);
+
+					quatfind_between_vectors(bsdup2realup.Rot, bsd_up, real_up);
+				}
+
+				ApplyPoseToPose(&ctx->bsd[i].Pose, &bsdup2realup, &ctx->bsd[i].Pose);
+
+				ctx->bsd[i].PositionSet = true;
+				ctx->request_floor_set = true;
+			}
+		}
+	}
+
+	SV_VERBOSE(50, "Read lighthouse db config file");
+	jsmn_free(&p);
+	return 0;
+}
+SURVIVE_EXPORT int survive_load_steamvr_lighthousedb_from_file(SurviveContext *ctx, const char *filename) {
+	if (ctx == 0)
+		return -1;
+
+	FILE *fp = fopen(filename, "r");
+	if (fp) {
+		fseek(fp, 0L, SEEK_END);
+		int len = ftell(fp);
+		fseek(fp, 0L, SEEK_SET);
+		if (len > 0) {
+			char *ct0conf = (char *)malloc(len);
+			size_t read = fread(ct0conf, 1, len, fp);
+			survive_load_steamvr_lighthousedb(ctx, ct0conf, len);
+			free(ct0conf);
+			fclose(fp);
+		}
+		return 0;
+	}
+
+	SV_WARN("Could not open lighthouse db file at '%s' (%d)", filename, errno);
+	return -1;
 }
 
 int survive_load_htc_config_format_from_file(SurviveObject *so, const char *filename) {
@@ -514,6 +652,7 @@ void survive_destroy_device(SurviveObject *so) {
 	}
 
 	survive_kalman_tracker_free(so->tracker);
+	SurviveSensorActivations_dtor(so);
 	free(so->tracker);
 	free(so->sensor_locations);
 	free(so->sensor_normals);

@@ -14,8 +14,74 @@
 #include <sv_matrix.h>
 
 #include "generated/survive_imu.generated.h"
+#include "survive_kalman_lighthouses.h"
 
 #define SURVIVE_MODEL_MAX_STATE_CNT (sizeof(SurviveKalmanModel) / sizeof(FLT))
+
+// clang-format off
+STRUCT_CONFIG_SECTION(SurviveKalmanTracker)
+	STRUCT_CONFIG_ITEM("light-error-threshold",  "Error limit to invalidate position",
+					   -1., t->light_error_threshold)
+	STRUCT_CONFIG_ITEM("min-report-time",
+					   "Minimum kalman report time in s (-1 defaults to 1. / imu_hz)", -1., t->min_report_time)
+
+	STRUCT_CONFIG_ITEM("use-adaptive-imu",  "Use adaptive kalman for IMU", 0, t->adaptive_imu)
+	STRUCT_CONFIG_ITEM("use-adaptive-lightcap",  "Use adaptive kalman for Lightcap", 0, t->adaptive_lightcap)
+	STRUCT_CONFIG_ITEM("use-adaptive-obs",  "Use adaptive kalman for observations", 0, t->adaptive_obs)
+
+	STRUCT_CONFIG_ITEM("report-ignore-start",  "Number of reports to ignore at startup", 0, t->report_ignore_start)
+	STRUCT_CONFIG_ITEM("report-ignore-threshold",
+					   "Minimum variance to report pose from the kalman filter", 1., t->report_threshold_var)
+	STRUCT_CONFIG_ITEM("light-ignore-threshold",
+					   "Minimum variance to allow light data into the kalman filter", 1., t->light_threshold_var)
+	STRUCT_CONFIG_ITEM("light-required-obs",
+					   "Minimum observations to allow light data into the kalman filter", 16, t->light_required_obs)
+
+	STRUCT_CONFIG_ITEM("light-variance",  "Variance of light sensor readings", 1e-4, t->light_var)
+	STRUCT_CONFIG_ITEM("obs-pos-variance",  "Variance of position integration from light capture",
+					   .02, t->obs_pos_var)
+	STRUCT_CONFIG_ITEM("obs-rot-variance",  "Variance of rotation integration from light capture",
+					   .01, t->obs_rot_var)
+
+	STRUCT_CONFIG_ITEM("use-raw-obs",  "Apply kalman filter as part of the pose solver", 0, t->use_raw_obs)
+
+	STRUCT_CONFIG_ITEM("show-raw-obs", "Show position of raw poser output", 0, t->show_raw_obs)
+
+	STRUCT_CONFIG_ITEM("light-error-for-lh-confidence",
+					   "Whether or not to invalidate LH positions based on kalman errors", 0, t->use_error_for_lh_pos)
+	STRUCT_CONFIG_ITEM("lightcap-rampin-length",
+					   "Number of lightcap measures to ramp in variance", 5000, t->light_rampin_length)
+
+	STRUCT_CONFIG_ITEM("process-weight-acc", "Acc variance per second", 10, t->params.process_weight_acc)
+	STRUCT_CONFIG_ITEM("process-weight-ang-vel", "Angular velocity variance per second", 1,
+					   t->params.process_weight_ang_velocity)
+	STRUCT_CONFIG_ITEM("process-weight-vel", "Velocity variance per second", 0, t->params.process_weight_vel)
+	STRUCT_CONFIG_ITEM("process-weight-pos", "Position variance per second", 0., t->params.process_weight_pos)
+	STRUCT_CONFIG_ITEM("process-weight-rot", "Rotation variance per second", 0, t->params.process_weight_rotation)
+	STRUCT_CONFIG_ITEM("process-weight-acc-bias", "Acc bias variance per second", 0, t->params.process_weight_acc_bias)
+	STRUCT_CONFIG_ITEM("process-weight-gyro-bias", "Gyro bias variance per seconid", 0, t->params.process_weight_gyro_bias)
+
+	STRUCT_CONFIG_ITEM("kalman-acc-scale-kp", "Incorporate scale coefficient while moving", .01, t->acc_scale_control.Kp)
+	STRUCT_CONFIG_ITEM("kalman-acc-scale-ki", "Incorporate scale coefficient while moving", .01, t->acc_scale_control.Ki)
+	STRUCT_CONFIG_ITEM("kalman-zvu-moving", "", -1, t->zvu_moving_var)
+	STRUCT_CONFIG_ITEM("kalman-zvu-stationary", "", 1e-4, t->zvu_stationary_var)
+	STRUCT_CONFIG_ITEM("kalman-zvu-no-light", "", 1e-4, t->zvu_no_light_var)
+
+	STRUCT_CONFIG_ITEM("imu-acc-norm-penalty", "", -1, t->acc_norm_penalty)
+	STRUCT_CONFIG_ITEM("imu-acc-variance", "Variance of accelerometer", 5e-3, t->acc_var)
+	STRUCT_CONFIG_ITEM("imu-gyro-variance", "Variance of gyroscope", 5e-3, t->gyro_var)
+
+	STRUCT_CONFIG_ITEM("light-batch-size", "", -1, t->light_batchsize)
+END_STRUCT_CONFIG_SECTION(SurviveKalmanTracker)
+// clang-format off
+
+FLT pid_update(struct pid_t* pid, FLT err, FLT dt) {
+	FLT der = err - pid->err;
+	pid->integration += err;
+	FLT output = pid->Kp * err + (pid->Ki * pid->integration * dt) + (pid->Kd * der /dt);
+	pid->err = err;
+	return output;
+}
 
 static SurviveKalmanModel copy_model(const FLT *src, size_t state_size) {
 	SurviveKalmanModel rtn = {0};
@@ -37,9 +103,17 @@ static inline FLT survive_kalman_tracker_position_var2(SurviveKalmanTracker *tra
 }
 
 static void normalize_model(SurviveKalmanTracker *pTracker) {
+	/*
+	FLT d = magnitude3d(pTracker->state.Pose.Rot + 1);
+	pTracker->state.Pose.Rot[0] = 0;
+	if(d < 1) {
+		pTracker->state.Pose.Rot[0] = FLT_SQRT(1 - d * d);
+	}
+*/
 	quatnormalize(pTracker->state.Pose.Rot, pTracker->state.Pose.Rot);
 	for (int i = 0; i < 3; i++) {
 		pTracker->state.GyroBias[i] = linmath_enforce_range(pTracker->state.GyroBias[i], -1e-1, 1e-1);
+		pTracker->state.AccBias[i] = linmath_enforce_range(pTracker->state.AccBias[i], -1e-1, 1e-1);
 	}
 	for (int i = 0; i < 3; i++) {
 		assert(isfinite(pTracker->state.Pose.Pos[i]));
@@ -49,32 +123,9 @@ static void normalize_model(SurviveKalmanTracker *pTracker) {
 	}
 }
 
-static inline void arr_eye_diag(FLT *m, int rows, int cols, const FLT *v) {
-	for (int i = 0; i < rows; i++) {
-		for (int j = 0; j < cols; j++) {
-			(m)[j * cols + i] = i == j ? (v ? v[i] : 1.) : 0.;
-		}
-	}
-}
-
 struct map_light_data_ctx {
-	PoserDataLight *pdl;
 	SurviveKalmanTracker *tracker;
 };
-
-static inline int get_axis(const struct PoserDataLight *pdl) {
-	switch (pdl->hdr.pt) {
-	case POSERDATA_LIGHT:
-		return (((PoserDataLightGen1 *)pdl)->acode & 1);
-		break;
-	case POSERDATA_LIGHT_GEN2:
-		return ((PoserDataLightGen2 *)pdl)->plane;
-		break;
-	default:
-		assert(0);
-	}
-	return 0;
-}
 
 /**
  * This function reuses the reproject functions to estimate what it thinks the lightcap angle should be based on x_t,
@@ -84,39 +135,48 @@ static inline int get_axis(const struct PoserDataLight *pdl) {
 static bool map_light_data(void *user, const struct SvMat *Z, const struct SvMat *x_t, struct SvMat *y,
 						   struct SvMat *H_k) {
 	struct map_light_data_ctx *cbctx = (struct map_light_data_ctx *)user;
-	const struct PoserDataLight *pdl = cbctx->pdl;
+
 	const SurviveKalmanTracker *tracker = cbctx->tracker;
 
 	SurviveObject *so = tracker->so;
 	struct SurviveContext *ctx = tracker->so->ctx;
-	const survive_reproject_model_t *mdl =
-		tracker->so->ctx->lh_version == 0 ? &survive_reproject_model : &survive_reproject_gen2_model;
-
-	int axis = get_axis(pdl);
-
-	survive_reproject_full_xy_fn_t project_fn = mdl->reprojectAxisFullFn[axis];
-	survive_reproject_axis_jacob_fn_t project_jacob_fn = mdl->reprojectAxisJacobFn[axis];
-	assert(ctx->bsd[pdl->lh].PositionSet);
-
-	const SurvivePose world2lh = InvertPoseRtn(&ctx->bsd[pdl->lh].Pose);
-	const SurvivePose obj2world = *(SurvivePose *)sv_as_const_vector(x_t);
-
-	const FLT *ptInObj = &so->sensor_locations[pdl->sensor_id * 3];
-	FLT h_x = project_fn(&obj2world, ptInObj, &world2lh, &ctx->bsd[pdl->lh].fcal[axis]);
-	sv_as_vector(y)[0] = sv_as_const_vector(Z)[0] - h_x;
+	const survive_reproject_model_t *mdl = survive_reproject_model(ctx);
 
 	sv_set_zero(H_k);
 
-	project_jacob_fn(sv_as_vector(H_k), &obj2world, ptInObj, &world2lh, &ctx->bsd[pdl->lh].fcal[axis]);
+	FLT *Y = sv_as_vector(y);
+	for (int i = 0; i < tracker->savedLight_idx; i++) {
+		const LightInfo *info = &tracker->savedLight[i];
+		int axis = info->axis;
+
+		survive_reproject_full_xy_fn_t project_fn = mdl->reprojectAxisFullFn[axis];
+		survive_reproject_axis_jacob_fn_t project_jacob_fn = mdl->reprojectAxisJacobFn[axis];
+		assert(ctx->bsd[info->lh].PositionSet);
+
+		const SurvivePose world2lh = InvertPoseRtn(&ctx->bsd[info->lh].Pose);
+		const SurvivePose obj2world = *(SurvivePose *)sv_as_const_vector(x_t);
+
+		const FLT *ptInObj = &so->sensor_locations[info->sensor_idx * 3];
+		FLT h_x = project_fn(&obj2world, ptInObj, &world2lh, &ctx->bsd[info->lh].fcal[axis]);
+		Y[i] = sv_as_const_vector(Z)[i] - h_x;
+        SV_DATA_LOG("Z_light[%d][%d][%d]", &info->value, 1, info->lh, info->axis, info->sensor_idx);
+		SV_DATA_LOG("h_light[%d][%d][%d]", &h_x, 1, info->lh, info->axis, info->sensor_idx);
+		SV_DATA_LOG("Y_light[%d][%d][%d]", Y, 1, info->lh, info->axis, info->sensor_idx);
+		FLT jacobian[7] = {0};
+		project_jacob_fn(jacobian, &obj2world, ptInObj, &world2lh, &ctx->bsd[info->lh].fcal[axis]);
+		for (int j = 0; j < 7; j++) {
+			svMatrixSet(H_k, i, j, jacobian[j]);
+		}
+	}
 	if (!sv_is_finite(H_k))
 		return false;
 
 	return true;
 }
 
-void survive_kalman_tracker_integrate_light(SurviveKalmanTracker *tracker, PoserDataLight *data) {
+void survive_kalman_tracker_integrate_saved_light(SurviveKalmanTracker *tracker, PoserData *pd) {
 	SurviveContext *ctx = tracker->so->ctx;
-
+	FLT time = pd->timecode / (FLT)tracker->so->timebase_hz;
 	if (tracker->use_raw_obs) {
 		return;
 	}
@@ -132,19 +192,28 @@ void survive_kalman_tracker_integrate_light(SurviveKalmanTracker *tracker, Poser
 		return;
 	}
 
-	if (!ctx->bsd[data->lh].PositionSet) {
-		return;
-	}
-
-	FLT time = data->hdr.timecode / (FLT)tracker->so->timebase_hz;
-	FLT delta = time - tracker->model.t;
 	tracker->last_light_time = time;
-
 	if (tracker->light_var >= 0) {
-		SvMat Z = svMat(1, 1, &data->angle);
+
+		for (int i = 0; i < tracker->savedLight_idx; i++) {
+			if (!ctx->bsd[tracker->savedLight[i].lh].PositionSet) {
+				tracker->savedLight[i] = tracker->savedLight[tracker->savedLight_idx - 1];
+				tracker->savedLight_idx--;
+				i--;
+			}
+		}
+
+        if (tracker->savedLight_idx == 0) {
+            return;
+        }
+
+        SV_CREATE_STACK_MAT(Z, tracker->savedLight_idx, 1);
+		for (int i = 0; i < tracker->savedLight_idx; i++) {
+			svMatrixSet(&Z, i, 0, tracker->savedLight[i].value);
+		}
+
 		struct map_light_data_ctx cbctx = {
 			.tracker = tracker,
-			.pdl = data,
 		};
 
 		SurviveObject *so = tracker->so;
@@ -154,44 +223,54 @@ void survive_kalman_tracker_integrate_light(SurviveKalmanTracker *tracker, Poser
 			light_var += tracker->obs_pos_var / ((FLT)tracker->stats.lightcap_count + 1.);
 		}
 		SV_DATA_LOG("light_var", &light_var, 1);
-
-		FLT rtn = survive_kalman_predict_update_state_extended(time, &tracker->model, &Z, &light_var, map_light_data,
+		FLT light_vars[32] = {0};
+		for (int i = 0; i < 32; i++)
+			light_vars[i] = light_var;
+		tracker->datalog_tag = "light_data";
+		FLT rtn = survive_kalman_predict_update_state_extended(time, &tracker->model, &Z, light_vars, map_light_data,
 															   &cbctx, tracker->adaptive_lightcap);
+		tracker->datalog_tag = 0;
 		if (!ramp_in && tracker->adaptive_lightcap) {
 			tracker->light_var = light_var;
 		}
-
+		SV_VERBOSE(110, "Light pass error %14.14f", rtn);
 		tracker->stats.lightcap_total_error += rtn;
 
 		tracker->light_residuals_all *= .9;
 		tracker->light_residuals_all += .1 * rtn;
 
-		tracker->light_residuals[data->lh] *= .9;
-		tracker->light_residuals[data->lh] += .1 * rtn;
-
-		tracker->stats.lightcap_error_by_lh[data->lh] += rtn;
-		tracker->stats.lightcap_count_by_lh[data->lh]++;
-
-		assert(data->lh >= 0);
-		assert(data->sensor_id >= 0);
-
 		SV_DATA_LOG("res_error_light_", &rtn, 1);
 		SV_DATA_LOG("res_error_light_avg", &tracker->light_residuals_all, 1);
-		SV_DATA_LOG("res_error_light[%d, %d, %d]", &tracker->light_residuals[data->lh], 1, data->lh, data->sensor_id,
-					get_axis(data));
-
-		if (tracker->light_residuals[data->lh] > .1 && tracker->use_error_for_lh_pos) {
-			// SV_WARN("Light residual for lh%d is too high -- %f", data->lh, tracker->light_residuals[data->lh]);
-			survive_lighthouse_adjust_confidence(ctx, data->lh, -.1);
-		}
 		tracker->stats.lightcap_count++;
 
-		normalize_model(tracker);
-		survive_kalman_tracker_report_state(&data->hdr, tracker);
+		survive_kalman_tracker_report_state(pd, tracker);
 	}
-	SV_VERBOSE(600, "Resultant state %f (%f) (lightcap %2d) (error %e, %e)  " Point16_format, time, delta, data->lh,
-			   tracker->light_residuals[data->lh], tracker->light_residuals_all,
-			   LINMATH_VEC16_EXPAND(sv_as_const_vector(&tracker->model.state)));
+}
+
+void survive_kalman_tracker_integrate_light(SurviveKalmanTracker *tracker, PoserDataLight *data) {
+	survive_kalman_lighthouse_integrate_light(tracker->so->ctx->bsd[data->lh].tracker, tracker->so, data);
+
+	bool isSync = data->hdr.pt == POSERDATA_SYNC || data->hdr.pt == POSERDATA_SYNC_GEN2;
+	if (isSync) {
+		survive_kalman_tracker_integrate_saved_light(tracker, &data->hdr);
+		tracker->savedLight_idx = 0;
+	} else {
+		LightInfo *info = &tracker->savedLight[tracker->savedLight_idx++];
+
+		info->lh = data->lh;
+		info->value = data->angle;
+		info->axis = PoserDataLight_axis(data);
+		info->sensor_idx = data->sensor_id;
+	}
+
+	int batchtrigger = sizeof(tracker->savedLight) / sizeof(tracker->savedLight[0]);
+	if (tracker->light_batchsize >= 0) {
+		batchtrigger = tracker->light_batchsize;
+	}
+	if (tracker->savedLight_idx >= batchtrigger) {
+		survive_kalman_tracker_integrate_saved_light(tracker, &data->hdr);
+		tracker->savedLight_idx = 0;
+	}
 }
 
 struct map_imu_data_ctx {
@@ -210,17 +289,12 @@ struct map_imu_data_ctx {
  * The actual code for this is generated from tools/generate_math_functions/imu_functions.py. It isn't done in
  * C natively to allow for the jacobian code to be generated using symengine
  */
-static bool map_imu_data(void *user, const struct SvMat *Z, const struct SvMat *x_t, struct SvMat *y,
+bool survive_kalman_tracker_imu_measurement_model(void *user, const struct SvMat *Z, const struct SvMat *x_t, struct SvMat *y,
 						 struct SvMat *H_k) {
-	struct map_imu_data_ctx *fn_ctx = user;
+
 	FLT h_x[6];
 
 	sv_set_constant(H_k, NAN);
-
-	SurviveContext *ctx = fn_ctx->tracker->so->ctx;
-
-	SV_VERBOSE(600, "X     " Point16_format, LINMATH_VEC16_EXPAND(sv_as_const_vector(x_t)))
-	SV_VERBOSE(600, "Z     " Point6_format, LINMATH_VEC6_EXPAND(sv_as_const_vector(Z)))
 
 	SurviveKalmanModel s = copy_model(sv_as_const_vector(x_t), x_t->rows);
 	gen_imu_predict(h_x, &s);
@@ -230,28 +304,82 @@ static bool map_imu_data(void *user, const struct SvMat *Z, const struct SvMat *
 	gen_imu_predict_jac_kalman_model(_H_k, &s);
 	sv_copy_in_row_major(H_k, _H_k, SURVIVE_MODEL_MAX_STATE_CNT);
 
-	SV_VERBOSE(600, "h_x   " Point6_format, LINMATH_VEC6_EXPAND(h_x))
+	struct map_imu_data_ctx *fn_ctx = user;
+
 	subnd(sv_as_vector(y), sv_as_const_vector(Z), h_x, Z->rows);
-	SV_VERBOSE(600, "y     " Point6_format, LINMATH_VEC6_EXPAND(sv_as_const_vector(y)))
+
+	if(fn_ctx) {
+		SurviveKalmanTracker * tracker = fn_ctx->tracker;
+		SurviveObject * so = fn_ctx->tracker->so;
+		SurviveContext *ctx = so->ctx;
+		SV_VERBOSE(600, "X     " Point7_format, LINMATH_VEC7_EXPAND(sv_as_const_vector(x_t)))
+		SV_VERBOSE(600, "Z     " Point6_format, LINMATH_VEC6_EXPAND(sv_as_const_vector(Z)))
+		SV_DATA_LOG("imu_prediction", h_x, 6);
+
+		LinmathVec3d up = {0, 0, 1};
+		FLT q[5];
+		LinmathVec3d imuWorld;
+		quatrotatevector(imuWorld, tracker->state.Pose.Rot, Z->data);
+
+		quatfrom2vectors(q, imuWorld, up);
+		q[4] = norm3d(q + 1);
+		quatrotateabout(q, q, tracker->state.Pose.Rot);
+		SV_DATA_LOG("perfect_q", q, 5);
+
+		LinmathVec3d perfect_acc;
+		quatrotatevector(perfect_acc, q, Z->data);
+		perfect_acc[2] -= 1;
+		SV_DATA_LOG("perfect_acc", perfect_acc, 3);
+	}
+
 	return true;
 }
 
-STATIC_CONFIG_ITEM(KALMAN_STATIONARY_ACC_SCALE_ALPHA, "kalman-stationary-acc-scale-alpha", 'f',
-				   "Incorporate scale coefficient while not moving", 0.005)
-STATIC_CONFIG_ITEM(KALMAN_MOVING_ACC_SCALE_ALPHA, "kalman-moving-acc-scale-alpha", 'f',
-				   "Incorporate scale coefficient while moving", 0.)
+static void tracker_datalog(survive_kalman_state_t* state, const char *desc, const FLT *v, size_t length) {
+	SurviveKalmanTracker *tracker = state->datalog_user;
+	SurviveObject * so = tracker->so;
+
+	if(tracker->datalog_tag == 0)
+		tracker->datalog_tag = "unknown";
+
+	SV_DATA_LOG("%s_%s", v, length, desc, tracker->datalog_tag);
+}
 
 void survive_kalman_tracker_integrate_imu(SurviveKalmanTracker *tracker, PoserDataIMU *data) {
 	SurviveContext *ctx = tracker->so->ctx;
 	SurviveObject *so = tracker->so;
 
-	FLT norm = 1. / norm3d(data->accel);
-	FLT w = SurviveSensorActivations_stationary_time(&tracker->so->activations) > .1 ? tracker->stationary_acc_scale
-																					 : tracker->moving_acc_scale;
-	tracker->acc_scale *= 1. - w;
-	tracker->acc_scale += w * norm;
+	FLT time = data->hdr.timecode / (FLT)tracker->so->timebase_hz;
+	FLT time_diff = time - tracker->model.t;
 
-	SV_DATA_LOG("acc_scale", &tracker->acc_scale, 1);
+	FLT norm = norm3d(data->accel);
+	SV_DATA_LOG("acc_norm", &norm, 1);
+	if(!isfinite(tracker->acc_scale)) {
+		tracker->acc_scale = norm;
+	}
+
+
+    if(isfinite(tracker->acc_scale)) {
+		FLT accel_scaled[3];
+		scale3d(accel_scaled, data->accel, 1. / tracker->acc_scale);
+		FLT accel_world[3];
+		quatrotatevector(accel_world, tracker->state.Pose.Rot, accel_scaled);
+		accel_world[2] -= 1;
+		scale3d(accel_world, accel_world, 9.80665);
+		SV_DATA_LOG("acc_world", accel_world, 3);
+
+		FLT norm_scaled = norm3d(accel_scaled);
+		SV_DATA_LOG("acc_norm_scaled", &norm_scaled, 1);
+	}
+
+
+	bool isStationary = SurviveSensorActivations_stationary_time(&tracker->so->activations) > 4800000;
+	if(isStationary) {
+		tracker->acc_scale += pid_update(&tracker->acc_scale_control, norm - tracker->acc_scale, .001);
+		SV_DATA_LOG("acc_scale_val", &tracker->acc_scale, 1);
+		SV_DATA_LOG("acc_scale_err", &tracker->acc_scale_control.err, 1);
+		SV_DATA_LOG("acc_scale_int", &tracker->acc_scale_control.integration, 1);
+	}
 
 	if (tracker->use_raw_obs) {
 		return;
@@ -266,9 +394,6 @@ void survive_kalman_tracker_integrate_imu(SurviveKalmanTracker *tracker, PoserDa
 		return;
 	}
 
-	FLT time = data->hdr.timecode / (FLT)tracker->so->timebase_hz;
-	FLT time_diff = time - tracker->model.t;
-
 	if (time_diff < -.01) {
 		// SV_WARN("Processing imu data from the past %fs", time - tracker->rot.t);
 		tracker->stats.late_imu_dropped++;
@@ -282,23 +407,32 @@ void survive_kalman_tracker_integrate_imu(SurviveKalmanTracker *tracker, PoserDa
 
 	FLT rotation_variance[] = {1e5, 1e5, 1e5, 1e5, 1e5, 1e5};
 
-	if (time - tracker->last_observation_time > .05) {
-		// clang-format off
-		SV_CREATE_STACK_MAT(H, 9, tracker->model.state_cnt);
+
+	FLT zvu_var = isStationary ? tracker->zvu_stationary_var : tracker->zvu_moving_var;
+	if (time - tracker->last_observation_time > .1) {
+		zvu_var = tracker->zvu_no_light_var;
+	}
+	if (zvu_var >= 0) {//time - tracker->last_light_time > .1) {//|| isStationary || fabs(1 - norm) < .001 ) {
+		// If we stop seeing light data; tank all velocity / acceleration measurements
+		size_t row_cnt = 9;
+		SV_CREATE_STACK_MAT(H, row_cnt, tracker->model.state_cnt);
 		sv_set_zero(&H);
-		for(int i = 0;i < 9;i++) {
+		for (int i = 0; i < row_cnt; i++) {
 			svMatrixSet(&H, i, 7 + i, 1);
 		}
 
-		FLT v = 1e-5;
-		FLT R[] = {
-			1e-5, 1e-5, 1e-5, 1e-5, 1e-5, 1e-5, 1e-5, 1e-5, 1e-5,
-		};
-		SV_CREATE_STACK_MAT(Z, 9, 1);
+		SV_CREATE_STACK_MAT(R, row_cnt, 1)
+		sv_set_constant(&R, zvu_var);
+		SV_CREATE_STACK_MAT(Z, row_cnt, 1);
 		sv_set_zero(&Z);
 
-		tracker->stats.imu_total_error += survive_kalman_predict_update_state(time, &tracker->model, &Z, &H, R, false);
+		tracker->datalog_tag = "zvu";
+		tracker->stats.imu_total_error +=
+			survive_kalman_predict_update_state(time, &tracker->model, &Z, &H, SV_RAW_PTR(&R), false);
+		tracker->datalog_tag = 0;
+
 		SV_FREE_STACK_MAT(Z);
+		SV_FREE_STACK_MAT(R);
 		SV_FREE_STACK_MAT(H);
 
 		SV_INFO("LOST LIGHT SYNCHRONIZATION\n");
@@ -310,8 +444,12 @@ void survive_kalman_tracker_integrate_imu(SurviveKalmanTracker *tracker, PoserDa
 	struct map_imu_data_ctx fn_ctx = {.tracker = tracker};
 	if (tracker->acc_var >= 0) {
 		fn_ctx.use_accel = true;
-		for (int i = 0; i < 3; i++)
+		for (int i = 0; i < 3; i++) {
 			rotation_variance[i] = tracker->acc_var;
+			if (tracker->acc_norm_penalty > 0) {
+				rotation_variance[i] += tracker->acc_norm_penalty * fabs(1 - norm);
+			}
+		}
 	}
 
 	if (tracker->gyro_var >= 0) {
@@ -325,7 +463,8 @@ void survive_kalman_tracker_integrate_imu(SurviveKalmanTracker *tracker, PoserDa
 		int rows = 6;
 		int offset = 0;
 		FLT accelgyro[6];
-		scale3d(accelgyro, data->accel, tracker->acc_scale);
+		scale3d(accelgyro, data->accel, 1. / tracker->acc_scale);
+
 		copy3d(accelgyro+3, data->gyro);
 
 		SvMat Z = svMat(rows, 1, accelgyro + offset);
@@ -333,8 +472,10 @@ void survive_kalman_tracker_integrate_imu(SurviveKalmanTracker *tracker, PoserDa
 		SV_VERBOSE(600, "Integrating IMU " Point6_format " with cov " Point6_format,
 				   LINMATH_VEC6_EXPAND((FLT *)&accelgyro[0]), LINMATH_VEC6_EXPAND(R));
 
-		FLT err = survive_kalman_predict_update_state_extended(time, &tracker->model, &Z, R, map_imu_data, &fn_ctx,
-															   tracker->adaptive_imu);
+		tracker->datalog_tag = "imu_meas";
+		FLT err = survive_kalman_predict_update_state_extended(
+			time, &tracker->model, &Z, R, survive_kalman_tracker_imu_measurement_model, &fn_ctx, tracker->adaptive_imu);
+		tracker->datalog_tag = 0;
 
 		SV_DATA_LOG("res_err_imu", &err, 1);
 		tracker->stats.imu_total_error += err;
@@ -350,7 +491,6 @@ void survive_kalman_tracker_integrate_imu(SurviveKalmanTracker *tracker, PoserDa
 
 		SV_VERBOSE(600, "Resultant state %f (imu %e) " Point19_format, time, tracker->imu_residuals,
 				   LINMATH_VEC19_EXPAND(sv_as_const_vector(&tracker->model.state)));
-		normalize_model(tracker);
 	}
 
 	survive_kalman_tracker_report_state(&data->hdr, tracker);
@@ -370,8 +510,12 @@ void survive_kalman_tracker_predict(const SurviveKalmanTracker *tracker, FLT t, 
 	SV_VERBOSE(300, "Predict pose %f %f " SurvivePose_format, t, t - tracker->model.t, SURVIVE_POSE_EXPAND(*out))
 }
 
-static void model_q_fn(void *user, FLT t, const SvMat *x, struct SvMat *q_out) {
-	SurviveKalmanTracker *tracker = (SurviveKalmanTracker *)user;
+static void survive_kalman_tracker_process_noise_bounce(void *user, FLT t, const SvMat *x, struct SvMat *q_out) {
+	struct SurviveKalmanTracker_Params *params = (struct SurviveKalmanTracker_Params *)user;
+	return survive_kalman_tracker_process_noise(params, t, x, q_out);
+}
+
+void survive_kalman_tracker_process_noise(const struct SurviveKalmanTracker_Params *params, FLT t, const SvMat *x, struct SvMat *q_out) {
 	size_t state_cnt = x->rows;
 	SurviveKalmanModel state = copy_model(sv_as_const_vector(x), state_cnt);
 
@@ -394,11 +538,11 @@ static void model_q_fn(void *user, FLT t, const SvMat *x, struct SvMat *q_out) {
 
 	FLT Q_vel[] = {t3 / 3., t2 / 2., t};
 
-	FLT q_p = tracker->process_weight_acc;
-	FLT p_p = q_p * Q_acc[0] + tracker->process_weight_vel * Q_vel[0] + tracker->process_weight_pos * t;
-	FLT p_v = q_p * Q_acc[1] + tracker->process_weight_vel * Q_vel[1];
+	FLT q_p = params->process_weight_acc;
+	FLT p_p = q_p * Q_acc[0] + params->process_weight_vel * Q_vel[0] + params->process_weight_pos * t;
+	FLT p_v = q_p * Q_acc[1] + params->process_weight_vel * Q_vel[1];
 	FLT p_a = q_p * Q_acc[2];
-	FLT v_v = q_p * Q_acc[3] + tracker->process_weight_vel * Q_vel[2];
+	FLT v_v = q_p * Q_acc[3] + params->process_weight_vel * Q_vel[2];
 	FLT v_a = q_p * Q_acc[4];
 	FLT a_a = q_p * Q_acc[5];
 
@@ -409,50 +553,53 @@ static void model_q_fn(void *user, FLT t, const SvMat *x, struct SvMat *q_out) {
 	  This is a rework using the same methodology. Some helper output functions are in the tools/generate_math_functions
 	  code.
 	 */
-	FLT s_w = tracker->process_weight_ang_velocity;
+	FLT s_w = params->process_weight_ang_velocity;
 	FLT s_f = s_w / 12. * t3;
 	FLT s_s = s_w / 4. * t2;
 	FLT qw = state.Pose.Rot[0], qx = state.Pose.Rot[1], qy = state.Pose.Rot[2], qz = state.Pose.Rot[3];
 	FLT qws = qw * qw, qxs = qx * qx, qys = qy * qy, qzs = qz * qz;
 	FLT qs = qws + qxs + qys + qzs;
 
-	FLT rv = tracker->process_weight_rotation * t;
+	FLT rv = params->process_weight_rotation * t + params->process_weight_ang_velocity * Q_vel[0];
 
+	FLT ga = params->process_weight_acc_bias * t;
 	/* The gyro bias is expected to change, but slowly through time */
-	FLT gb = 1e-10 * t;
-
+	FLT gb = params->process_weight_gyro_bias * t;
 
 	// This is the best way I could think to write the final block matrix...
 	// clang-format off
 	FLT Q[] = {
-	//	      x        y        z                 qw                 qx                 qy                 qz         vx       vy       vz          avx      avy      avz       ax       ay       az        bx, by, bz,
-		    p_p,       0,       0,                 0,                 0,                 0,                 0,       p_v,       0,       0,           0,       0,       0,     p_a,       0,       0,        0,  0,  0, // x
-		      0,     p_p,       0,                 0,                 0,                 0,                 0,         0,     p_v,       0,           0,       0,       0,       0,     p_a,       0,        0,  0,  0, // y
-		      0,       0,     p_p,                 0,                 0,                 0,                 0,         0,       0,     p_v,           0,       0,       0,       0,       0,     p_a,        0,  0,  0, // z
+	//	      x        y        z                 qw                 qx                 qy                 qz         vx       vy       vz          avx      avy      avz       ax       ay       az       abx, aby, abz      bx, by, bz,
+		    p_p,       0,       0,                 0,                 0,                 0,                 0,       p_v,       0,       0,           0,       0,       0,     p_a,       0,       0,        0,  0,  0,       0,   0,  0,  // x
+		      0,     p_p,       0,                 0,                 0,                 0,                 0,         0,     p_v,       0,           0,       0,       0,       0,     p_a,       0,        0,  0,  0,       0,   0,  0,  // y
+		      0,       0,     p_p,                 0,                 0,                 0,                 0,         0,       0,     p_v,           0,       0,       0,       0,       0,     p_a,        0,  0,  0,       0,   0,  0,  // z
 
-		      0,       0,       0,   rv+s_f*(qs-qws),      s_f*(-qw*qx),      s_f*(-qw*qy),      s_f*(-qw*qz),         0,       0,       0,     -s_s*qx, -s_s*qy, -s_s*qz,       0,       0,       0,        0,  0,  0, // qw
-		      0,       0,       0,      s_f*(-qw*qx),   rv+s_f*(qs-qxs),      s_f*(-qx*qy),      s_f*(-qx*qz),         0,       0,       0,      s_s*qw, -s_s*qz,  s_s*qy,       0,       0,       0,        0,  0,  0, // qx
-		      0,       0,       0,      s_f*(-qw*qy),      s_f*(-qx*qy),   rv+s_f*(qs-qys),      s_f*(-qy*qz),         0,       0,       0,      s_s*qz,  s_s*qw, -s_s*qx,       0,       0,       0,        0,  0,  0, // qy
-		      0,       0,       0,      s_f*(-qw*qz),      s_f*(-qx*qz),      s_f*(-qy*qz),   rv+s_f*(qs-qzs),         0,       0,       0,     -s_s*qy,  s_s*qx,  s_s*qw,       0,       0,       0,        0,  0,  0, // qz
-
-
-		      p_v,     0,       0,                 0,                 0,                 0,                 0,       v_v,       0,       0,           0,       0,       0,     v_a,       0,       0,        0,  0,  0, // vx
-		      0,     p_v,       0,                 0,                 0,                 0,                 0,         0,     v_v,       0,           0,       0,       0,       0,     v_a,       0,        0,  0,  0, // vy
-		      0,       0,     p_v,                 0,                 0,                 0,                 0,         0,       0,     v_v,           0,       0,       0,       0,       0,     v_a,        0,  0,  0, // vz
-
-		      0,       0,       0,           -s_s*qx,            s_s*qw,            s_s*qz,           -s_s*qy,         0,       0,       0,     s_w * t,       0,       0,       0,       0,       0,        0,  0,  0, // avx
-		      0,       0,       0,           -s_s*qy,           -s_s*qz,            s_s*qw,            s_s*qx,         0,       0,       0,           0, s_w * t,       0,       0,       0,       0,        0,  0,  0, // avy
-		      0,       0,       0,           -s_s*qz,            s_s*qy,           -s_s*qx,            s_s*qw,         0,       0,       0,           0,       0, s_w * t,       0,       0,       0,        0,  0,  0, // avz
+		      0,       0,       0,   rv+s_f*(qs-qws),      s_f*(-qw*qx),      s_f*(-qw*qy),      s_f*(-qw*qz),         0,       0,       0,     -s_s*qx, -s_s*qy, -s_s*qz,       0,       0,       0,        0,  0,  0,       0,   0,  0,  // qw
+		      0,       0,       0,      s_f*(-qw*qx),   rv+s_f*(qs-qxs),      s_f*(-qx*qy),      s_f*(-qx*qz),         0,       0,       0,      s_s*qw, -s_s*qz,  s_s*qy,       0,       0,       0,        0,  0,  0,       0,   0,  0,  // qx
+		      0,       0,       0,      s_f*(-qw*qy),      s_f*(-qx*qy),   rv+s_f*(qs-qys),      s_f*(-qy*qz),         0,       0,       0,      s_s*qz,  s_s*qw, -s_s*qx,       0,       0,       0,        0,  0,  0,       0,   0,  0,  // qy
+		      0,       0,       0,      s_f*(-qw*qz),      s_f*(-qx*qz),      s_f*(-qy*qz),   rv+s_f*(qs-qzs),         0,       0,       0,     -s_s*qy,  s_s*qx,  s_s*qw,       0,       0,       0,        0,  0,  0,       0,   0,  0,  // qz
 
 
-		    p_a,       0,       0,                 0,                 0,                 0,                 0,       v_a,       0,       0,           0,       0,       0,     a_a,       0,       0,        0,  0,  0, // ax
-		      0,     p_a,       0,                 0,                 0,                 0,                 0,         0,     v_a,       0,           0,       0,       0,       0,     a_a,       0,        0,  0,  0, // ay
-		      0,       0,     p_a,                 0,                 0,                 0,                 0,         0,       0,     v_a,           0,       0,       0,       0,       0,     a_a,        0,  0,  0, // az
+		      p_v,     0,       0,                 0,                 0,                 0,                 0,       v_v,       0,       0,           0,       0,       0,     v_a,       0,       0,        0,  0,  0,       0,   0,  0,  // vx
+		      0,     p_v,       0,                 0,                 0,                 0,                 0,         0,     v_v,       0,           0,       0,       0,       0,     v_a,       0,        0,  0,  0,       0,   0,  0,  // vy
+		      0,       0,     p_v,                 0,                 0,                 0,                 0,         0,       0,     v_v,           0,       0,       0,       0,       0,     v_a,        0,  0,  0,       0,   0,  0,  // vz
 
-		      0,       0,       0,                 0,                 0,                 0,                 0,         0,       0,       0,           0,       0,       0,       0,       0,       0,       gb,  0,  0 , // bx
-			  0,       0,       0,                 0,                 0,                 0,                 0,         0,       0,       0,           0,       0,       0,       0,       0,       0,        0, gb,  0 , // by
-			  0,       0,       0,                 0,                 0,                 0,                 0,         0,       0,       0,           0,       0,       0,       0,       0,       0,        0,  0, gb , // bz
+		      0,       0,       0,           -s_s*qx,            s_s*qw,            s_s*qz,           -s_s*qy,         0,       0,       0,     s_w * t,       0,       0,       0,       0,       0,        0,  0,  0,       0,   0,  0,  // avx
+		      0,       0,       0,           -s_s*qy,           -s_s*qz,            s_s*qw,            s_s*qx,         0,       0,       0,           0, s_w * t,       0,       0,       0,       0,        0,  0,  0,       0,   0,  0,  // avy
+		      0,       0,       0,           -s_s*qz,            s_s*qy,           -s_s*qx,            s_s*qw,         0,       0,       0,           0,       0, s_w * t,       0,       0,       0,        0,  0,  0,       0,   0,  0,  // avz
 
+
+		    p_a,       0,       0,                 0,                 0,                 0,                 0,       v_a,       0,       0,           0,       0,       0,     a_a,       0,       0,        0,  0,  0,       0,   0,  0,  // ax
+		      0,     p_a,       0,                 0,                 0,                 0,                 0,         0,     v_a,       0,           0,       0,       0,       0,     a_a,       0,        0,  0,  0,       0,   0,  0,  // ay
+		      0,       0,     p_a,                 0,                 0,                 0,                 0,         0,       0,     v_a,           0,       0,       0,       0,       0,     a_a,        0,  0,  0,       0,   0,  0,  // az
+
+		      0,       0,       0,                 0,                 0,                 0,                 0,         0,       0,       0,           0,       0,       0,       0,       0,       0,       ga,  0,  0 ,      0,   0,  0,   // abx
+			  0,       0,       0,                 0,                 0,                 0,                 0,         0,       0,       0,           0,       0,       0,       0,       0,       0,        0, ga,  0 ,      0,   0,  0,   // aby
+			  0,       0,       0,                 0,                 0,                 0,                 0,         0,       0,       0,           0,       0,       0,       0,       0,       0,        0,  0, ga ,      0,   0,  0,   // abz
+
+			  0,       0,       0,                 0,                 0,                 0,                 0,         0,       0,       0,           0,       0,       0,       0,       0,       0,        0,  0,  0 ,     gb,   0,  0,   // abz
+			  0,       0,       0,                 0,                 0,                 0,                 0,         0,       0,       0,           0,       0,       0,       0,       0,       0,        0,  0,  0 ,      0,  gb,  0,   // abz
+			  0,       0,       0,                 0,                 0,                 0,                 0,         0,       0,       0,           0,       0,       0,       0,       0,       0,        0,  0,  0 ,      0,   0, gb,   // abz
 	};
 	// clang-format on
 
@@ -470,17 +617,20 @@ static void model_q_fn(void *user, FLT t, const SvMat *x, struct SvMat *q_out) {
  * The prediction model and associated F matrix use generated code to simplifiy the jacobian. This might not be strictly
  * necessary but allows for quicker development.
  */
-static void model_predict(FLT t, const survive_kalman_state_t *k, const SvMat *f_in, SvMat *f_out) {
-	// assert(t > 0);
-
+void survive_kalman_tracker_model_predict(FLT t, const survive_kalman_state_t *k, const SvMat *f_in, SvMat *f_out) {
 	SurviveKalmanModel s_in = copy_model(sv_as_const_vector(f_in), f_in->rows);
 	SurviveKalmanModel s_out = {0};
+
+	struct SurviveKalmanTracker_Params *params = (struct SurviveKalmanTracker_Params *)k->user;
+
+	quatnormalize(s_in.Pose.Rot, s_in.Pose.Rot);
 	gen_kalman_model_predict(s_out.Pose.Pos, t, &s_in);
+	quatnormalize(s_out.Pose.Rot, s_out.Pose.Rot);
 
 	memcpy(sv_as_vector(f_out), s_out.Pose.Pos, f_in->rows * sizeof(FLT));
 }
 
-static void model_predict_jac(FLT t, struct SvMat *f_out, const struct SvMat *x0) {
+void survive_kalman_tracker_predict_jac(FLT t, struct SvMat *f_out, const struct SvMat *x0) {
 	SurviveKalmanModel s = copy_model(sv_as_const_vector(x0), x0->rows);
 
 	size_t state_cnt = x0->rows;
@@ -503,8 +653,9 @@ static FLT integrate_pose(SurviveKalmanTracker *tracker, FLT time, const Survive
 	}
 
 	SvMat Zp = svMat(7, 1, (void *)pose->Pos);
+	tracker->datalog_tag = "pose_obs";
 	rtn = survive_kalman_predict_update_state(time, &tracker->model, &Zp, &H, R ? R : tracker->Obs_R, R == 0);
-
+	tracker->datalog_tag = 0;
 	SurviveContext *ctx = tracker->so->ctx;
 	SV_VERBOSE(600, "Resultant state %f (pose) " Point16_format, time,
 			   LINMATH_VEC16_EXPAND(sv_as_const_vector(&tracker->model.state)));
@@ -514,16 +665,22 @@ static FLT integrate_pose(SurviveKalmanTracker *tracker, FLT time, const Survive
 
 void survive_kalman_tracker_integrate_observation(PoserData *pd, SurviveKalmanTracker *tracker, const SurvivePose *pose,
 												  const FLT *oR) {
-	if (tracker->use_raw_obs) {
-		SurviveObject *so = tracker->so;
+	SurviveObject *so = tracker->so;
+	SurviveContext *ctx = so->ctx;
 
+	if (tracker->show_raw_obs) {
+		char external_name[16] = {0};
+		sprintf(external_name, "%s-raw-obs", so->codename);
+		SURVIVE_INVOKE_HOOK(external_pose, ctx, external_name, pose);
+	}
+
+	if (tracker->use_raw_obs) {
 		SURVIVE_INVOKE_HOOK_SO(imupose, so, pd->timecode, pose);
 		return;
 	}
 
 	survive_long_timecode timecode = pd->timecode;
 
-	struct SurviveContext *ctx = tracker->so->ctx;
 	FLT time = timecode / (FLT)tracker->so->timebase_hz;
 	if (tracker->model.t == 0) {
 		tracker->model.t = time;
@@ -542,7 +699,7 @@ void survive_kalman_tracker_integrate_observation(PoserData *pd, SurviveKalmanTr
 			// Scale up the covariance
 			FLT pS = 10, rS = 1;
 			FLT Raug[] = {pS * tdiff, pS * tdiff, pS * tdiff, rS * tdiff, rS * tdiff, rS * tdiff, rS * tdiff};
-			addnd(R, R, Raug, 7);
+			// addnd(R, R, Raug, 7);
 
 			time = tracker->model.t;
 		} else {
@@ -567,76 +724,7 @@ void survive_kalman_tracker_integrate_observation(PoserData *pd, SurviveKalmanTr
 	}
 }
 
-STATIC_CONFIG_ITEM(KALMAN_USE_ERROR_FOR_LH_CONFIDENCE, "light-error-for-lh-confidence", 'i',
-				   "Whether or not to invalidate LH positions based on kalman errors", 0)
-STATIC_CONFIG_ITEM(KALMAN_LIGHTCAP_RAMPIN_LENGTH, "lightcap-rampin-length", 'i',
-				   "Number of lightcap measures to ramp in variance", 5000)
-
-STATIC_CONFIG_ITEM(KALMAN_LIGHT_ERROR_THRESHOLD, "light-error-threshold", 'f', "Error limit to invalidate position", .1)
-STATIC_CONFIG_ITEM(KALMAN_MIN_REPORT_TIME, "min-report-time", 'f',
-				   "Minimum kalman report time in s (-1 defaults to 1. / imu_hz)", -1.)
-
-STATIC_CONFIG_ITEM(KALMAN_USE_ADAPTIVE_IMU, "use-adaptive-imu", 'i', "Use adaptive kalman for IMU", 0)
-STATIC_CONFIG_ITEM(KALMAN_USE_ADAPTIVE_LIGHTCAP, "use-adaptive-lightcap", 'i', "Use adaptive kalman for Lightcap", 0)
-STATIC_CONFIG_ITEM(KALMAN_USE_ADAPTIVE_OBS, "use-adaptive-obs", 'i', "Use adaptive kalman for observations", 0)
-
-STATIC_CONFIG_ITEM(PROCESS_WEIGHT_ACC, "process-weight-acc", 'f', "Acc variance per second", 10.)
-
-STATIC_CONFIG_ITEM(PROCESS_WEIGHT_ANGULAR_VELOCITY, "process-weight-ang-vel", 'f', "Angular velocity variance per second", 1.)
-STATIC_CONFIG_ITEM(PROCESS_WEIGHT_VEL, "process-weight-vel", 'f', "Velocity variance per second", 0.)
-
-STATIC_CONFIG_ITEM(PROCESS_WEIGHT_POS, "process-weight-pos", 'f', "Position variance per second", 0.)
-STATIC_CONFIG_ITEM(PROCESS_WEIGHT_ROTATION, "process-weight-rot", 'f', "Rotation variance per second", 0.)
-
-STATIC_CONFIG_ITEM(KALMAN_MODEL_ACCEL, "model-acc", 'i',
-				   "Whether or not to model the acceleration in the kalman filter", 1)
-STATIC_CONFIG_ITEM(KALMAN_USE_GYRO_BIAS, "model-gyro-bias", 'i',
-				   "Whether or not to model the gyro bias in the kalman filter", 1)
-STATIC_CONFIG_ITEM(KALMAN_REPORT_IGNORE_START, "report-ignore-start", 'i', "Number of reports to ignore at startup", 0)
-STATIC_CONFIG_ITEM(KALMAN_REPORT_IGNORE_THRESHOLD, "report-ignore-threshold", 'f',
-				   "Minimum variance to report pose from the kalman filter", 1.)
-STATIC_CONFIG_ITEM(KALMAN_LIGHTCAP_IGNORE_THRESHOLD, "light-ignore-threshold", 'f',
-				   "Minimum variance to allow light data into the kalman filter", 1.)
-STATIC_CONFIG_ITEM(KALMAN_LIGHTCAP_REQUIRED_OBS, "light-required-obs", 'i',
-				   "Minimum observations to allow light data into the kalman filter", 16)
-
-STATIC_CONFIG_ITEM(LIGHT_VARIANCE, "light-variance", 'f', "Variance of light sensor readings", 1e-6)
-STATIC_CONFIG_ITEM(OBS_POS_VARIANCE, "obs-pos-variance", 'f', "Variance of position integration from light capture",
-				   .02)
-STATIC_CONFIG_ITEM(OBS_ROT_VARIANCE, "obs-rot-variance", 'f', "Variance of rotation integration from light capture",
-				   .01)
-
-STATIC_CONFIG_ITEM(IMU_ACC_VARIANCE, "imu-acc-variance", 'f', "Variance of accelerometer", 5e-5)
-STATIC_CONFIG_ITEM(IMU_GYRO_VARIANCE, "imu-gyro-variance", 'f', "Variance of gyroscope", 1e-2)
-
-STATIC_CONFIG_ITEM(USE_IMU, "use-imu", 'i', "Use the IMU as part of the pose solver", 1)
-STATIC_CONFIG_ITEM(USE_KALMAN, "use-kalman", 'i', "Apply kalman filter as part of the pose solver", 1)
-
 typedef void (*survive_attach_detach_fn)(SurviveContext *ctx, const char *tag, FLT *var);
-
-static void survive_kalman_tracker_config(SurviveKalmanTracker *tracker, survive_attach_detach_fn fn) {
-	fn(tracker->so->ctx, KALMAN_MIN_REPORT_TIME_TAG, &tracker->min_report_time);
-	fn(tracker->so->ctx, KALMAN_LIGHT_ERROR_THRESHOLD_TAG, &tracker->light_error_threshold);
-	fn(tracker->so->ctx, KALMAN_LIGHTCAP_IGNORE_THRESHOLD_TAG, &tracker->light_threshold_var);
-	fn(tracker->so->ctx, KALMAN_REPORT_IGNORE_THRESHOLD_TAG, &tracker->report_threshold_var);
-
-	fn(tracker->so->ctx, IMU_ACC_VARIANCE_TAG, &tracker->acc_var);
-	fn(tracker->so->ctx, IMU_GYRO_VARIANCE_TAG, &tracker->gyro_var);
-
-	fn(tracker->so->ctx, OBS_POS_VARIANCE_TAG, &tracker->obs_pos_var);
-	fn(tracker->so->ctx, OBS_ROT_VARIANCE_TAG, &tracker->obs_rot_var);
-	fn(tracker->so->ctx, LIGHT_VARIANCE_TAG, &tracker->light_var);
-
-	fn(tracker->so->ctx, PROCESS_WEIGHT_ACC_TAG, &tracker->process_weight_acc);
-	fn(tracker->so->ctx, PROCESS_WEIGHT_VEL_TAG, &tracker->process_weight_vel);
-	fn(tracker->so->ctx, PROCESS_WEIGHT_POS_TAG, &tracker->process_weight_pos);
-
-	fn(tracker->so->ctx, PROCESS_WEIGHT_ANGULAR_VELOCITY_TAG, &tracker->process_weight_ang_velocity);
-	fn(tracker->so->ctx, PROCESS_WEIGHT_ROTATION_TAG, &tracker->process_weight_rotation);
-
-	fn(tracker->so->ctx, KALMAN_MOVING_ACC_SCALE_ALPHA_TAG, &tracker->moving_acc_scale);
-	fn(tracker->so->ctx, KALMAN_STATIONARY_ACC_SCALE_ALPHA_TAG, &tracker->stationary_acc_scale);
-}
 
 void survive_kalman_tracker_reinit(SurviveKalmanTracker *tracker) {
 	memset(&tracker->stats, 0, sizeof(tracker->stats));
@@ -645,37 +733,37 @@ void survive_kalman_tracker_reinit(SurviveKalmanTracker *tracker) {
 	tracker->last_light_time = 0;
 	tracker->last_observation_time = 0;
 	tracker->light_residuals_all = 0;
-	survive_kalman_state_reset(&tracker->model);
 
 	memset(&tracker->state, 0, sizeof(tracker->state));
 	tracker->state.Pose.Rot[0] = 1;
 
+	survive_kalman_state_reset(&tracker->model);
+	for (int i = 0; i < 7; i++) {
+		svMatrixSet(&tracker->model.P, i, i, 1e10);
+	}
 	size_t state_cnt = tracker->model.state_cnt;
-	sv_set_zero(&tracker->model.P);
-
-	for (int i = 0; i < state_cnt; i++) {
-		svMatrixSet(&tracker->model.P, i, i, 1e3);
-	}
-	for (int i = 16; i < state_cnt; i++) {
-		svMatrixSet(&tracker->model.P, i, i, 1);
-	}
 
 	FLT Rrs = tracker->obs_rot_var;
 	FLT Rps = tracker->obs_pos_var;
 	FLT Rr[] = {Rrs, Rrs, Rrs, Rrs, Rps, Rps, Rps};
-	arr_eye_diag(tracker->Obs_R, 7, 7, Rr);
+	struct SvMat ObsR = svMat(7, 7, tracker->Obs_R);
+	sv_set_diag(&ObsR, Rr);
 
 	FLT Rimu[] = {tracker->acc_var,	 tracker->acc_var,	tracker->acc_var,
 				  tracker->gyro_var, tracker->gyro_var, tracker->gyro_var};
-	arr_eye_diag(tracker->IMU_R, 6, 6, Rimu);
-}
+	struct SvMat IMU_R = svMat(6, 6, tracker->IMU_R);
+	sv_set_diag(&IMU_R, Rimu);
 
-static void print_configf(SurviveContext *ctx, const char *tag, FLT *var) { SV_VERBOSE(10, "\t%-32s %e", tag, *var); }
+	FLT var_diag[SURVIVE_MODEL_MAX_STATE_CNT] = {0};
+	FLT p_threshold = survive_kalman_tracker_position_var2(tracker, var_diag, tracker->model.state_cnt);
+	SurviveObject * so = tracker->so;
+	SV_DATA_LOG("tracker_P", var_diag, tracker->model.state_cnt);
+}
 
 void survive_kalman_tracker_init(SurviveKalmanTracker *tracker, SurviveObject *so) {
 	memset(tracker, 0, sizeof(*tracker));
 
-	tracker->acc_scale = 1.0;
+	tracker->acc_scale = NAN;
 	tracker->so = so;
 
 	struct SurviveContext *ctx = tracker->so->ctx;
@@ -684,18 +772,7 @@ void survive_kalman_tracker_init(SurviveKalmanTracker *tracker, SurviveObject *s
 	// origin has a variance of 10m; and the quat can be varied by 4 -- which is
 	// more than any actual normalized quat could be off by.
 
-	tracker->model_gyro_bias = survive_configi(tracker->so->ctx, KALMAN_USE_GYRO_BIAS_TAG, SC_GET, 1);
-	tracker->model_accel = survive_configi(tracker->so->ctx, KALMAN_MODEL_ACCEL_TAG, SC_GET, 1);
-	survive_attach_configi(tracker->so->ctx, KALMAN_REPORT_IGNORE_START_TAG, &tracker->report_ignore_start);
-	survive_attach_configi(tracker->so->ctx, KALMAN_LIGHTCAP_REQUIRED_OBS_TAG, &tracker->light_required_obs);
-	survive_attach_configi(tracker->so->ctx, KALMAN_USE_ADAPTIVE_IMU_TAG, &tracker->adaptive_imu);
-	survive_attach_configi(tracker->so->ctx, KALMAN_USE_ADAPTIVE_LIGHTCAP_TAG, &tracker->adaptive_lightcap);
-	survive_attach_configi(tracker->so->ctx, KALMAN_USE_ADAPTIVE_OBS_TAG, &tracker->adaptive_obs);
-
-	tracker->use_error_for_lh_pos = survive_configi(ctx, KALMAN_USE_ERROR_FOR_LH_CONFIDENCE_TAG, SC_GET, 1);
-	tracker->light_rampin_length = survive_configi(ctx, KALMAN_LIGHTCAP_RAMPIN_LENGTH_TAG, SC_GET, 5000);
-
-	survive_kalman_tracker_config(tracker, survive_attach_configf);
+	SurviveKalmanTracker_attach_config(tracker->so->ctx, tracker);
 
 	bool use_imu = (bool)survive_configi(ctx, "use-imu", SC_GET, 1);
 	if (!use_imu) {
@@ -705,32 +782,37 @@ void survive_kalman_tracker_init(SurviveKalmanTracker *tracker, SurviveObject *s
 	bool use_kalman = (bool)survive_configi(ctx, "use-kalman", SC_GET, 1);
 	tracker->use_raw_obs = !use_kalman;
 
-	if (ctx) {
-		survive_kalman_set_logging_level(ctx->log_level);
-	}
 	size_t state_cnt = sizeof(SurviveKalmanModel) / sizeof(FLT);
 
-	if (!tracker->model_gyro_bias) {
+	if (tracker->params.process_weight_gyro_bias == 0.) {
 		state_cnt -= 3;
+		if (tracker->params.process_weight_acc_bias == 0.) {
+			state_cnt -= 3;
+			if (tracker->params.process_weight_acc == 0.) {
+				state_cnt -= 3;
+				if (tracker->params.process_weight_ang_velocity == 0.) {
+					state_cnt -= 3;
+					if (tracker->params.process_weight_vel == 0.) {
+						state_cnt -= 3;
+					}
+				}
+			}
+		}
 	}
 
-	if (tracker->model_gyro_bias && !tracker->model_accel) {
-		SV_WARN("Use of gyro bias but no acceleration model is not implemented. Turning acceleration model on.");
-		tracker->model_accel = true;
+	survive_kalman_state_init(&tracker->model, state_cnt, survive_kalman_tracker_predict_jac,
+							  survive_kalman_tracker_process_noise_bounce, &tracker->params, (FLT *)&tracker->state);
+	if (ctx) {
+		survive_kalman_set_logging_level(&tracker->model, ctx->log_level);
 	}
 
-	if (!tracker->model_accel) {
-		state_cnt -= 3;
-	}
-
-	survive_kalman_state_init(&tracker->model, state_cnt, model_predict_jac, model_q_fn, tracker,
-							  (FLT *)&tracker->state);
-	tracker->model.Predict_fn = model_predict;
+	tracker->model.Predict_fn = survive_kalman_tracker_model_predict;
+	tracker->model.datalog_user = tracker;
+	tracker->model.datalog = tracker_datalog;
 
 	survive_kalman_tracker_reinit(tracker);
 
-	SV_VERBOSE(10, "Tracker config for %s", tracker->so->codename);
-	survive_kalman_tracker_config(tracker, print_configf);
+	SV_VERBOSE(10, "Tracker config for %s (%d state count)", survive_colorize_codename(tracker->so), (int)state_cnt);
 }
 
 SurviveVelocity survive_kalman_tracker_velocity(const SurviveKalmanTracker *tracker) {
@@ -813,18 +895,16 @@ void survive_kalman_tracker_free(SurviveKalmanTracker *tracker) {
 
 	survive_kalman_state_free(&tracker->model);
 
-	survive_detach_config(tracker->so->ctx, KALMAN_REPORT_IGNORE_START_TAG, &tracker->report_ignore_start);
-	survive_detach_config(tracker->so->ctx, KALMAN_USE_ADAPTIVE_IMU_TAG, &tracker->adaptive_imu);
-	survive_detach_config(tracker->so->ctx, KALMAN_USE_ADAPTIVE_LIGHTCAP_TAG, &tracker->adaptive_lightcap);
-	survive_detach_config(tracker->so->ctx, KALMAN_USE_ADAPTIVE_OBS_TAG, &tracker->adaptive_obs);
-	survive_detach_config(tracker->so->ctx, KALMAN_LIGHTCAP_REQUIRED_OBS_TAG, &tracker->light_required_obs);
-
-	survive_kalman_tracker_config(tracker, (survive_attach_detach_fn)survive_detach_config);
+	SurviveKalmanTracker_detach_config(tracker->so->ctx, tracker);
 }
 
 void survive_kalman_tracker_lost_tracking(SurviveKalmanTracker *tracker, bool allowLHReset) {
+	if (tracker == 0)
+		return;
+
 	SurviveContext *ctx = tracker->so->ctx;
-	SV_WARN("Too many failures for %s; reseting calibration %e (%7.4f stationary)", tracker->so->codename,
+	SV_WARN("Too many failures for %s at %f; reseting calibration %e (%7.4f stationary)", survive_colorize_codename(tracker->so),
+			survive_run_time(ctx),
 			tracker->light_residuals_all,
 			SurviveSensorActivations_stationary_time(&tracker->so->activations) / 48000000.);
 	tracker->light_residuals_all = 0;
@@ -870,6 +950,7 @@ bool survive_kalman_tracker_check_valid(SurviveKalmanTracker *tracker) {
 
 void survive_kalman_tracker_report_state(PoserData *pd, SurviveKalmanTracker *tracker) {
 	SurvivePose pose = {0};
+	normalize_model(tracker);
 
 	FLT t = pd->timecode / (FLT)tracker->so->timebase_hz;
 
@@ -877,6 +958,10 @@ void survive_kalman_tracker_report_state(PoserData *pd, SurviveKalmanTracker *tr
 		assert(tracker->model.t - t < 1);
 		t = tracker->model.t;
 	}
+
+	SurviveObject *so = tracker->so;
+	assert(fabs(1 - quatmagnitude(tracker->state.Pose.Rot)) < 1e-4);
+	SV_DATA_LOG("model_state", (const FLT *)&tracker->state, tracker->model.state_cnt);
 
 	if (tracker->so->conf == 0) {
 		return;
@@ -899,12 +984,12 @@ void survive_kalman_tracker_report_state(PoserData *pd, SurviveKalmanTracker *tr
 	}
 
 	survive_kalman_tracker_predict(tracker, t, &pose);
+	SV_DATA_LOG("model_predict", (FLT *)pose.Pos, sizeof(pose) / sizeof(FLT));
 
 	size_t state_cnt = tracker->model.state_cnt;
 	FLT var_diag[SURVIVE_MODEL_MAX_STATE_CNT] = {0};
-	FLT p_threshold = survive_kalman_tracker_position_var2(tracker, var_diag, 7 + 6);
-	SurviveObject *so = tracker->so;
-	SV_DATA_LOG("tracker_P", var_diag, 7 + 6);
+	FLT p_threshold = survive_kalman_tracker_position_var2(tracker, var_diag, tracker->model.state_cnt);
+	SV_DATA_LOG("tracker_P", var_diag, tracker->model.state_cnt);
 
 	if ((tracker->report_threshold_var > 0 && p_threshold >= tracker->report_threshold_var) ||
 		(tracker->report_ignore_start > tracker->report_ignore_start_cnt)) {
@@ -921,9 +1006,10 @@ void survive_kalman_tracker_report_state(PoserData *pd, SurviveKalmanTracker *tr
 	SV_VERBOSE(600, "Tracker variance %s " Point16_format, tracker->so->codename, LINMATH_VEC16_EXPAND(var_diag));
 	SV_VERBOSE(600, "Tracker Bias %s     " Point3_format, tracker->so->codename,
 			   LINMATH_VEC3_EXPAND(tracker->state.GyroBias));
+	SV_VERBOSE(600, "%f Tracker report %s   " SurvivePose_format, survive_run_time(ctx), tracker->so->codename,
+			   SURVIVE_POSE_EXPAND(pose));
 
 	tracker->stats.reported_poses++;
-	SV_VERBOSE(600, "Tracker report %s   " SurvivePose_format, tracker->so->codename, SURVIVE_POSE_EXPAND(pose));
 
 	SurviveVelocity velocity = survive_kalman_tracker_velocity(tracker);
 
@@ -932,6 +1018,8 @@ void survive_kalman_tracker_report_state(PoserData *pd, SurviveKalmanTracker *tr
 	}
 	tracker->last_report_time = t;
 
+	tracker->so->poseConfidence = 1. / p_threshold;
+	SV_VERBOSE(110, "%s confidence %7.7f", survive_colorize_codename(so), 1. / p_threshold);
 	if (so->OutPose_timecode < pd->timecode) {
 		SURVIVE_INVOKE_HOOK_SO(imupose, so, pd->timecode, &pose);
 	}

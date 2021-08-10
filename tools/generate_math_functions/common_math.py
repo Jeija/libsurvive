@@ -79,17 +79,18 @@ class LinmathAxisAnglePose(SurviveType):
         return self.AxisAngleRot
 
 class SurviveKalmanModel(SurviveType):
-    def __init__(self, p, v, a, b):
+    def __init__(self, p, v, a, accB, b):
         self.Pose = p
         self.Velocity = v
         self.Acc = a
+        self.AccBias = accB
         self.GyroBias = b
 
 def gyro_bias():
     return sp.symbols('gbx, gby, gbz')
 
 def kalman_model():
-    return SurviveKalmanModel(obj_p(), obj_v(), obj_acc(), gyro_bias())
+    return SurviveKalmanModel(obj_p(), obj_v(), obj_acc(), obj_acc_bias(), gyro_bias())
 
 def obj_p():
     if axis_angle_mode:
@@ -130,6 +131,9 @@ def obj_v():
 
 def obj_acc():
     return sp.symbols('acc_x, acc_y, acc_z')
+
+def obj_acc_bias():
+    return sp.symbols('acc_biasx, acc_biasy, acc_biasz')
 
 def lh_p():
     if axis_angle_mode:
@@ -246,6 +250,20 @@ def axisanglerotatevector(axis_angle, sensor_pt):
     x, y, z = sensor_pt
     return axisanglerotationmatrix(axis_angle) * sp.Matrix((x, y, z))
 
+def obj2world_aa_up_err(axis_angle, sensor_pt):
+    out = axisanglerotatevector(axis_angle, sensor_pt)
+    return 1 - out[2]
+
+def world2lh_aa_up_err(axis_angle, sensor_pt):
+    [ax,ay,az] = axis_angle
+    out = axisanglerotatevector([-ax,-ay,-az], sensor_pt)
+    return 1 - out[2]
+
+def invertaxisanglerotatevector(axis_angle, sensor_pt):
+    x, y, z = sensor_pt
+    ax, ay, az = axis_angle
+    return axisanglerotationmatrix([-ax,-ay,-az]) * sp.Matrix((x, y, z))
+
 
 def quatgetreciprocal(q):
     return [q[0], -q[1], -q[2], -q[3]]
@@ -256,8 +274,9 @@ def apply_axisangle_pose_to_pt(obj_p_axisangle, sensor_pt):
 
 
 def invert_pose(obj_p):
-    r = quatgetreciprocal(obj_p.Rot)
-    return (-1 * quatrotatevector(r, obj_p.Pos), r)
+    r = quatgetreciprocal(quatnormalize(obj_p.Rot))
+    X,Y,Z = quatrotatevector(r, obj_p.Pos)
+    return sp.Matrix([-X,-Y,-Z, *r])
 
 def quat2axisangle(q):
     qw, qi, qj, qk = q
@@ -348,5 +367,8 @@ generate = [
     quatrotationmatrix,
     sensor_to_world,
     cross,
-    apply_ang_velocity
+    apply_ang_velocity,
+    obj2world_aa_up_err,
+    world2lh_aa_up_err,
+
 ]

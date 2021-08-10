@@ -1,4 +1,5 @@
 #include "math.h"
+#include "survive_kalman_lighthouses.h"
 #include "survive_kalman_tracker.h"
 #include <assert.h>
 #include <linmath.h>
@@ -36,7 +37,10 @@ STATIC_CONFIG_ITEM(CENTER_ON_LH0, "center-on-lh0", 'i',
 STATIC_CONFIG_ITEM(HAPTIC_ON_CALIBRATE, "haptic-on-calibrate", 'i',
 				   "Trigger a haptic pulse when lighthouse positions are solved", 1);
 
-void PoserData_poser_pose_func(PoserData *poser_data, SurviveObject *so, const SurvivePose *imu2world) {
+STATIC_CONFIG_ITEM(LIGHTHOUSE_NORMALIZE_ANGLE, "normalize-lighthouse-angle", 'f',
+				   "Angle about Z to adust calibration by", 0.);
+
+void PoserData_poser_pose_func(PoserData *poser_data, SurviveObject *so, const SurvivePose *imu2world, FLT error) {
 	SurviveContext *ctx = so->ctx;
 	for (int i = 0; i < 3; i++) {
 		assert(!isnan(imu2world->Pos[i]));
@@ -49,17 +53,20 @@ void PoserData_poser_pose_func(PoserData *poser_data, SurviveObject *so, const S
 	if (poser_data->poseproc) {
 		poser_data->poseproc(so, poser_data->timecode, imu2world, poser_data->userdata);
 	} else {
-		survive_kalman_tracker_integrate_observation(poser_data, so->tracker, imu2world, 0);
+		FLT p_e = error;
+		FLT r_e = error;
+		FLT R[7] = {p_e, p_e, p_e, r_e, r_e, r_e, r_e };
+		survive_kalman_tracker_integrate_observation(poser_data, so->tracker, imu2world, R);
 	}
 }
 void PoserData_poser_pose_func_with_velocity(PoserData *poser_data, SurviveObject *so, const SurvivePose *imu2world,
 											 const SurviveVelocity *velocity) {
 	SURVIVE_INVOKE_HOOK_SO(velocity, so, poser_data->timecode, velocity);
-	PoserData_poser_pose_func(poser_data, so, imu2world);
+	PoserData_poser_pose_func(poser_data, so, imu2world, -1);
 }
 
 void PoserData_lighthouse_pose_func(PoserData *poser_data, SurviveObject *so, uint8_t lighthouse,
-									SurvivePose *lighthouse_pose, SurvivePose *object_pose) {
+									SurvivePose *lighthouse_pose, FLT var, SurvivePose *object_pose) {
 	if (poser_data && poser_data->lighthouseposeproc) {
 		for (int i = 0; i < 7; i++)
 			assert(!isnan(((FLT *)lighthouse_pose)[i]));
@@ -163,8 +170,17 @@ void PoserData_lighthouse_pose_func(PoserData *poser_data, SurviveObject *so, ui
 		for (int i = 0; i < 7; i++)
 			assert(!isnan(((FLT *)&lighthouse2world)[i]));
 
-		so->ctx->bsd[lighthouse].confidence = 1.;
-		SURVIVE_INVOKE_HOOK(lighthouse_pose, so->ctx, lighthouse, &lighthouse2world);
+		FLT p_var = .1, r_var = .01;
+
+		if (var > 0) {
+			// Var is a measure of how much the data going into the computation was varied; so scale
+			p_var = M_PI / var * .0001;
+			r_var = M_PI / var * .00001;
+		} else if (var == 0) {
+			p_var = r_var = 0;
+		}
+		FLT obs_var[7] = {p_var, p_var, p_var, r_var, r_var, r_var, r_var};
+		survive_kalman_lighthouse_integrate_observation(so->ctx->bsd[lighthouse].tracker, lighthouse_pose, obs_var);
 	}
 }
 
@@ -185,8 +201,48 @@ int8_t survive_get_reference_bsd(SurviveContext *ctx, SurvivePose *lighthouse_po
 	return ref;
 }
 
+void PoserData_normalize_scene(SurviveContext *ctx, SurvivePose *lighthouse_pose, uint32_t lighthouse_count,
+							   SurvivePose *object_pose) {
+	FLT lhNormAngleOffset = survive_configf(ctx, LIGHTHOUSE_NORMALIZE_ANGLE_TAG, SC_GET, 0);
+	uint32_t lh_indices[NUM_GEN2_LIGHTHOUSES] = {0};
+	uint32_t cnt = 0;
+
+	uint32_t reference_basestation = survive_configi(ctx, "reference-basestation", SC_GET, 0);
+	SurvivePose object2arb = *object_pose;
+
+	for (int lh = 0; lh < lighthouse_count; lh++) {
+		SurvivePose lh2object = lighthouse_pose[lh];
+		if (quatmagnitude(lh2object.Rot) != 0.0) {
+			lh_indices[cnt] = lh;
+			uint32_t lh0 = lh_indices[0];
+			bool preferThisBSD = reference_basestation == 0 ? (ctx->bsd[lh].BaseStationID < ctx->bsd[lh0].BaseStationID)
+															: reference_basestation == ctx->bsd[lh].BaseStationID;
+			if (preferThisBSD) {
+				lh_indices[0] = lh;
+				lh_indices[cnt] = lh0;
+			}
+			cnt++;
+		}
+	}
+
+	SurvivePose *preferredLH = &lighthouse_pose[lh_indices[0]];
+	FLT ang = atan2(preferredLH->Pos[1], preferredLH->Pos[0]);
+	FLT ang_target = M_PI / 2. + lhNormAngleOffset * M_PI / 180.;
+	FLT euler[3] = {0, 0, ang_target - ang};
+	SurvivePose arb2world = {0};
+	quatfromeuler(arb2world.Rot, euler);
+
+	ApplyPoseToPose(object_pose, &arb2world, &object2arb);
+	for (int lh = 0; lh < lighthouse_count; lh++) {
+		SurvivePose *lh2object = &lighthouse_pose[lh];
+		if (quatmagnitude(lh2object->Rot) != 0.0) {
+			ApplyPoseToPose(lh2object, &arb2world, lh2object);
+		}
+	}
+}
+
 void PoserData_lighthouse_poses_func(PoserData *poser_data, SurviveObject *so, SurvivePose *lighthouse_pose,
-									 uint32_t lighthouse_count, SurvivePose *object_pose) {
+									 FLT *variances, uint32_t lighthouse_count, SurvivePose *object_pose) {
 
 	if (poser_data && poser_data->lighthouseposeproc) {
 		for (int lighthouse = 0; lighthouse < lighthouse_count; lighthouse++) {
@@ -244,7 +300,8 @@ void PoserData_lighthouse_poses_func(PoserData *poser_data, SurviveObject *so, S
 				ApplyPoseToPose(&lh2world, &object2World, &lh2object);
 			}
 
-			PoserData_lighthouse_pose_func(poser_data, so, lh, &lh2world, &object2World);
+			PoserData_lighthouse_pose_func(poser_data, so, lh, &lh2world, variances ? variances[lh] : -1,
+										   &object2World);
 		}
 
 		if (hapticOnCalibrate) {
@@ -380,5 +437,21 @@ int survive_threaded_poser_fn(SurviveObject *so, void **user, PoserData *pd) {
 	}
 	}
 
+	return 0;
+}
+
+SURVIVE_EXPORT int PoserDataLight_axis(const struct PoserDataLight *pdl) {
+	switch (pdl->hdr.pt) {
+	case POSERDATA_LIGHT:
+	case POSERDATA_SYNC:
+		return (((PoserDataLightGen1 *)pdl)->acode & 1);
+		break;
+	case POSERDATA_SYNC_GEN2:
+	case POSERDATA_LIGHT_GEN2:
+		return ((PoserDataLightGen2 *)pdl)->plane;
+		break;
+	default:
+		assert(0);
+	}
 	return 0;
 }

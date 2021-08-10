@@ -4,6 +4,7 @@
 #define _USE_MATH_DEFINES
 #include <math.h>
 #include <survive_reproject.h>
+#include <survive_reproject_gen2.h>
 
 #include "force_O3.h"
 
@@ -63,6 +64,16 @@ void survive_reproject_full(const BaseStationCal *bcal, const SurvivePose *world
 
 	survive_reproject_xy(bcal, t_pt, out);
 }
+SURVIVE_EXPORT void survive_reproject_full_axisangle(const BaseStationCal *bcal, const LinmathAxisAnglePose *world2lh, const LinmathAxisAnglePose *obj2world,
+													 const LinmathVec3d obj_pt, SurviveAngleReading out) {
+	LinmathVec3d world_pt;
+	ApplyAxisAnglePoseToPoint(world_pt, obj2world, obj_pt);
+
+	LinmathPoint3d t_pt;
+	ApplyAxisAnglePoseToPoint(t_pt, world2lh, world_pt);
+
+	survive_reproject_xy(bcal, t_pt, out);
+}
 void survive_reproject_from_pose_with_bcal(const BaseStationCal *bcal, const SurvivePose *world2lh,
 										   LinmathVec3d const ptInWorld, SurviveAngleReading out) {
 	LinmathPoint3d ptInLh;
@@ -88,7 +99,11 @@ void survive_apply_bsd_calibration(const SurviveContext *ctx, int lh, const Surv
 	out[1] = in[1] + cal[1].phase;
 }
 
-const survive_reproject_model_t SURVIVE_EXPORT survive_reproject_model = {
+SURVIVE_EXPORT const survive_reproject_model_t* survive_reproject_model(SurviveContext* ctx) {
+	return ctx->lh_version == 0 ? &survive_reproject_gen1_model : &survive_reproject_gen2_model;
+}
+
+const survive_reproject_model_t SURVIVE_EXPORT survive_reproject_gen1_model = {
 #ifdef BUILD_LH1_SUPPORT
 	.reprojectAxisFn = {survive_reproject_axis_x, survive_reproject_axis_y},
 	.reprojectXY = survive_reproject_xy,
@@ -99,6 +114,11 @@ const survive_reproject_model_t SURVIVE_EXPORT survive_reproject_model = {
 	.reprojectFullJacLhPose = gen_reproject_jac_lh_p,
 	.reprojectAxisJacobLhPoseFn = {gen_reproject_axis_x_jac_lh_p, gen_reproject_axis_y_jac_lh_p},
 
+	.reprojectAxisangleFullXyFn =
+		{
+			gen_reproject_axis_x_axis_angle,
+			gen_reproject_axis_y_axis_angle,
+		},
 	.reprojectAxisAngleFullJacObjPose = gen_reproject_jac_obj_p_axis_angle,
 	.reprojectAxisAngleAxisJacobFn = {gen_reproject_axis_x_jac_obj_p_axis_angle,
 									  gen_reproject_axis_y_jac_obj_p_axis_angle},

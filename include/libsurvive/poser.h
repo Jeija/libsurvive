@@ -43,12 +43,10 @@ SURVIVE_EXPORT int32_t PoserData_size(const PoserData *poser_data);
  *
  * @param poser_data the data pointer passed into the poser function invocation
  * @param so The survive object which we are giving a solution for.
- * @param lighthouse @deprecated The lighthouse which observed that position. Make it -1 if it was a combination of
- * lighthouses. Will be removed in the future.
  * @param pose The actual object pose. This is in world space, not in LH space. It must represent a transformation from
  * object space of the SO to global space.
  */
-SURVIVE_EXPORT void PoserData_poser_pose_func(PoserData *poser_data, SurviveObject *so, const SurvivePose *pose);
+SURVIVE_EXPORT void PoserData_poser_pose_func(PoserData *poser_data, SurviveObject *so, const SurvivePose *pose, FLT reprojError);
 
 /**
  * Meant to be used by individual posers to report back their findings on the pose of an object back to the invoker of
@@ -77,10 +75,12 @@ SURVIVE_EXPORT void PoserData_poser_pose_func_with_velocity(PoserData *poser_dat
  * @param object_pose This is the assumed or derived position of the tracked object.
  */
 SURVIVE_EXPORT void PoserData_lighthouse_pose_func(PoserData *poser_data, SurviveObject *so, uint8_t lighthouse,
-												   SurvivePose *lighthouse_pose, SurvivePose *object_pose);
+												   SurvivePose *lighthouse_pose, FLT var, SurvivePose *object_pose);
+SURVIVE_EXPORT void PoserData_normalize_scene(SurviveContext *ctx, SurvivePose *lighthouse_pose,
+											  uint32_t lighthouse_count, SurvivePose *object_pose);
 SURVIVE_EXPORT void PoserData_lighthouse_poses_func(PoserData *poser_data, SurviveObject *so,
-													SurvivePose *lighthouse_pose, uint32_t lighthouse_count,
-													SurvivePose *object_pose);
+													SurvivePose *lighthouse_pose, FLT *variances,
+													uint32_t lighthouse_count, SurvivePose *object_pose);
 SURVIVE_EXPORT int8_t survive_get_reference_bsd(SurviveContext *ctx, SurvivePose *lighthouse_pose,
 												uint32_t lighthouse_count);
 
@@ -119,6 +119,7 @@ typedef struct PoserDataLightGen2 {
 	uint32_t sync;
 } PoserDataLightGen2;
 
+SURVIVE_EXPORT int PoserDataLight_axis(const struct PoserDataLight *pdl);
 typedef struct {
 	FLT value;
 	uint8_t lh;

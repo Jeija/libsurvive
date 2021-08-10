@@ -27,7 +27,7 @@ option(DOWNLOAD_EIGEN "Download eigen if it isn't installed on the system" OFF)
 option(USE_EIGEN "Use eigen for math operations" DOWNLOAD_EIGEN)
 option(USE_COLUMN_MAJOR_MATRICES "Use column major matrices for math operations" OFF)
 
-find_package (Eigen3 3 NO_MODULE)
+find_package (Eigen3 3 NO_MODULE NO_CMAKE_FIND_ROOT_PATH)
 if(NOT EIGEN3_FOUND)
   if(DOWNLOAD_EIGEN)
     find_program(GIT git)
@@ -277,8 +277,8 @@ if(NOT WIN32 AND PYTHON_GENERATED_DIR)
       list(APPEND INCLUDE_FLAGS "-I${include_directory}")
     endforeach()
 
-    add_custom_target(pysurvive ALL COMMAND ${Python3_EXECUTABLE} ${CTYPESGEN} ${CMAKE_SOURCE_DIR}/include/libsurvive/*.h ${INCLUDE_FLAGS}  --custom-library-loader --no-macros -L$<TARGET_FILE_DIR:survive> -lsurvive
-      --strip-prefix=survive_ -P Survive -o ${PYTHON_GENERATED_DIR}pysurvive_generated.py)
+    #add_custom_target(pysurvive ALL COMMAND ${Python3_EXECUTABLE} ${CTYPESGEN} ${CMAKE_SOURCE_DIR}/include/libsurvive/*.h ${INCLUDE_FLAGS}  --custom-library-loader --no-macros -L$<TARGET_FILE_DIR:survive> -lsurvive
+     # --strip-prefix=survive_ -P Survive -o ${PYTHON_GENERATED_DIR}pysurvive_generated.py)
   endif()
 
 endif()

@@ -63,6 +63,7 @@ LOCAL_SRC_FILES := \
     src/survive.c \
     src/survive_api.c \
     src/survive_async_optimizer.c \
+    src/survive_buildinfo.c \
     src/survive_config.c \
     src/survive_default_devices.c \
     src/survive_disambiguator.c \
@@ -83,8 +84,8 @@ LOCAL_SRC_FILES := \
 ifeq ($(SURVIVE_MATH_BACKEND),eigen)
     LOCAL_HEADER_LIBRARIES := libeigen
     LOCAL_SRC_FILES += \
-        redist/minimal_opencv.c \
-        redist/minimal_opencv.eigen.cpp
+        redist/sv_matrix.c \
+        redist/sv_matrix.eigen.cpp
 endif
 
 ifneq ($(TARGET_SURVIVE_CONFIG_PATH),)

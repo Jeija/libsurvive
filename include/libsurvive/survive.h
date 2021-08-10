@@ -34,6 +34,8 @@ typedef struct SurviveSensorActivations_s {
 	FLT angles_center_dev[NUM_GEN2_LIGHTHOUSES][2];
 	int angles_center_cnt[NUM_GEN2_LIGHTHOUSES][2];
 
+	FLT raw_angles[SENSORS_PER_OBJECT][NUM_GEN2_LIGHTHOUSES][2];					 // 2 Axes (Angles in LH space)
+	survive_long_timecode raw_timecode[SENSORS_PER_OBJECT][NUM_GEN2_LIGHTHOUSES][2]; // Timecode per axis in ticks
 	survive_long_timecode timecode[SENSORS_PER_OBJECT][NUM_GEN2_LIGHTHOUSES][2]; // Timecode per axis in ticks
 
 	// Valid only for Gen1
@@ -52,6 +54,15 @@ typedef struct SurviveSensorActivations_s {
 	FLT accel[3];
 	FLT gyro[3];
 	FLT mag[3];
+
+	struct SurviveSensorActivations_params {
+		FLT moveThresholdGyro;
+		FLT moveThresholdAcc;
+		FLT moveThresholdAng;
+		FLT filterLightChange;
+		FLT filterOutlierCriteria;
+		FLT filterVarianceMin;
+	} params;
 } SurviveSensorActivations;
 
 struct PoserDataLight;
@@ -59,6 +70,7 @@ struct PoserDataIMU;
 
 SURVIVE_EXPORT void SurviveSensorActivations_reset(SurviveSensorActivations *self);
 SURVIVE_EXPORT void SurviveSensorActivations_ctor(SurviveObject *so, SurviveSensorActivations *self);
+SURVIVE_EXPORT void SurviveSensorActivations_dtor(SurviveObject *so);
 SURVIVE_EXPORT survive_long_timecode SurviveSensorActivations_long_timecode_imu(const SurviveSensorActivations *self, survive_timecode timecode);
 SURVIVE_EXPORT survive_long_timecode SurviveSensorActivations_long_timecode_light(const SurviveSensorActivations *self, survive_timecode timecode);
 
@@ -67,10 +79,14 @@ SURVIVE_EXPORT survive_long_timecode SurviveSensorActivations_long_timecode_ligh
  */
 SURVIVE_EXPORT FLT SurviveSensorActivations_difference(const SurviveSensorActivations *rhs,
         const SurviveSensorActivations *lhs);
+SURVIVE_EXPORT void SurviveSensorActivations_add_sync(SurviveSensorActivations *self, struct PoserDataLight *lightData);
 SURVIVE_EXPORT bool SurviveSensorActivations_add(SurviveSensorActivations *self, struct PoserDataLightGen1 *lightData);
 SURVIVE_EXPORT bool SurviveSensorActivations_add_gen2(SurviveSensorActivations *self,
 													  struct PoserDataLightGen2 *lightData);
-
+SURVIVE_EXPORT void SurviveSensorActivations_valid_counts(SurviveSensorActivations *self,
+														  survive_long_timecode tolerance, uint32_t *meas_cnt,
+														  uint32_t *lh_count, uint32_t *axis_cnt,
+														  size_t *meas_for_lhs_axis);
 SURVIVE_EXPORT void SurviveSensorActivations_register_runtime(SurviveSensorActivations *self, survive_long_timecode tc,
 															  uint64_t runtime_clock);
 SURVIVE_EXPORT uint64_t SurviveSensorActivations_runtime(SurviveSensorActivations *self, survive_long_timecode tc);
@@ -84,7 +100,7 @@ SURVIVE_EXPORT bool SurviveSensorActivations_is_reading_valid(const SurviveSenso
 															  survive_long_timecode tolerance, uint32_t sensor_idx,
 															  int lh, int axis);
 
-SURVIVE_EXPORT survive_timecode SurviveSensorActivations_time_since_last_reading(const SurviveSensorActivations *self,
+SURVIVE_EXPORT survive_long_timecode SurviveSensorActivations_time_since_last_reading(const SurviveSensorActivations *self,
 																				 uint32_t sensor_idx, int lh, int axis);
 
 SURVIVE_EXPORT survive_long_timecode SurviveSensorActivations_last_reading(const SurviveSensorActivations *self,
@@ -245,12 +261,15 @@ struct BaseStationData {
 	BaseStationCal fcal[2];
 
 	uint8_t sys_unlock_count;
-	int8_t accel[3]; //"Up" vector
+	LinmathPoint3d accel; //"Up" vector
 	uint8_t mode;
 
 	FLT confidence;
 	void *ootx_data;
 	void *user_ptr;
+	bool disable;
+	uint8_t OOTXChecked : 1;
+	struct SurviveKalmanLighthouse *tracker;
 };
 
 struct config_group;
@@ -345,6 +364,7 @@ struct SurviveContext {
 
 	// Additional details that we don't want / need to expose to every single include
 	void *private_members;
+	bool request_floor_set;
 };
 
 SURVIVE_EXPORT void survive_verify_FLT_size(
@@ -416,9 +436,23 @@ SURVIVE_EXPORT void survive_config_as_str(SurviveContext *ctx, char *output, siz
 
 SURVIVE_EXPORT const char *survive_configs(SurviveContext *ctx, const char *tag, char flags, const char *def);
 
+SURVIVE_EXPORT void survive_attach_config(SurviveContext *ctx, const char *tag, void * var, char type);
 SURVIVE_EXPORT void survive_attach_configi(SurviveContext *ctx, const char *tag, int32_t *var);
 SURVIVE_EXPORT void survive_attach_configf(SurviveContext *ctx, const char *tag, FLT * var );
 SURVIVE_EXPORT void survive_attach_configs(SurviveContext *ctx, const char *tag, char * var );
+
+#define SURVIVE_ATTACH_CONFIG(ctx, name, var) _Generic((var), \
+              double*: survive_attach_configf, \
+              float*: survive_attach_configf,  \
+              int*: survive_attach_configi  \
+)(ctx, name, var);
+
+#define SURVIVE_CONFIG_BIND_VARIABLE(name, desc, def, var) _Generic((var), \
+              double*: survive_config_bind_variablef, \
+              float*: survive_config_bind_variablef,  \
+              int*: survive_config_bind_variablei  \
+)(name, desc, def);
+
 SURVIVE_EXPORT void survive_detach_config(SurviveContext *ctx, const char *tag, void * var );
 
 SURVIVE_EXPORT int8_t survive_get_bsd_idx(SurviveContext *ctx, survive_channel channel);
@@ -458,8 +492,29 @@ SURVIVE_EXPORT int8_t survive_get_bsd_idx(SurviveContext *ctx, survive_channel c
 	SURVIVE_EXPORT_CONSTRUCTOR void REGISTER##variable() {                                                             \
 		survive_config_bind_variable(type, name, description, default_value, 0xcafebeef);                              \
 	}
-SURVIVE_EXPORT void survive_config_bind_variable(char vt, const char *name, const char *description,
-												 ...); // Only used at boot.
+
+#define STRUCT_CONFIG_SECTION(type) \
+static void type##_bind_variables(SurviveContext* ctx, type* t, bool ctor) {
+
+#define STRUCT_CONFIG_ITEM(name, description, default_value, var)                                      \
+	if (t && ctor) {                                                                                                           \
+            var = default_value;                                                                                                           \
+            SURVIVE_ATTACH_CONFIG(ctx, name, &var);                                                                                                           \
+	} else if(t) {                                                                                                       \
+			survive_detach_config(ctx, name, &var);                                                                    \
+	} else {                                                                                                           \
+		SURVIVE_CONFIG_BIND_VARIABLE(name, description, default_value, &var);                          \
+	}
+
+#define END_STRUCT_CONFIG_SECTION(type)                                                                                \
+	}                                                                                                                  \
+SURVIVE_EXPORT_CONSTRUCTOR void REGISTER##type() { type##_bind_variables(0, 0, 0); }                                  \
+void type##_attach_config(SurviveContext* ctx, type* t) { type##_bind_variables(ctx, t, 1); }                          \
+void type##_detach_config(SurviveContext* ctx, type* t) { type##_bind_variables(ctx, t, 0); }                          \
+
+SURVIVE_EXPORT void survive_config_bind_variable(char vt, const char *name, const char *description, ...); // Only used at boot.
+SURVIVE_EXPORT void survive_config_bind_variablei(const char *name, const char *description, int def);
+SURVIVE_EXPORT void survive_config_bind_variablef(const char *name, const char *description, FLT def);
 
 // Read back a human-readable string description of the calibration status
 SURVIVE_EXPORT int survive_cal_get_status(SurviveContext *ctx, char *description, int description_length);
@@ -553,6 +608,7 @@ SURVIVE_EXPORT bool *survive_add_threaded_driver(SurviveContext *ctx, void *driv
 												 void *(routine)(void *), DeviceDriverCb close);
 SURVIVE_EXPORT char *survive_export_config(SurviveObject *so);
 SURVIVE_EXPORT void survive_reset_lighthouse_positions(SurviveContext *ctx);
+SURVIVE_EXPORT void survive_reset_lighthouse_position(SurviveContext *ctx, int bsd_idx);
 
 // This is the disambiguator function, for taking light timing and figuring out place-in-sweep for a given photodiode.
 SURVIVE_EXPORT uint8_t survive_map_sensor_id(SurviveObject *so, uint8_t reported_id);
@@ -597,7 +653,7 @@ SURVIVE_EXPORT uint32_t survive_hash_str(const char *str);
 
 #define SV_VERBOSE(lvl, ...)                                                                                           \
 	{                                                                                                                  \
-		if (ctx == 0 || ctx->log_level >= lvl) {                                                                       \
+		if (ctx == 0 || ctx->log_level >= (lvl)) {                                                                     \
 			SV_INFO(__VA_ARGS__);                                                                                      \
 		}                                                                                                              \
 	}

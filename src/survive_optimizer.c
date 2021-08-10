@@ -8,6 +8,7 @@
 #include <zlib.h>
 #endif
 
+#include "generated/survive_reproject.aux.generated.h"
 #include "survive_optimizer.h"
 
 #include "mpfit/mpfit.h"
@@ -200,14 +201,23 @@ static inline void run_pair_measurement(survive_optimizer *mpfunc_ctx, size_t me
 
 	FLT out[2];
 	reprojectModel->reprojectXY(cal, sensorPtInLH, out);
-
-	deviates[0] = (out[meas[0].axis] - meas[0].value) / meas[0].variance;
-	deviates[1] = (out[meas[1].axis] - meas[1].value) / meas[1].variance;
+	assert(meas[0].axis == 0);
+	assert(meas[1].axis == 1);
+#ifndef NDEBUG
+	if (reprojectModel->reprojectAxisangleFullXyFn[0]) {
+		FLT check[] = {reprojectModel->reprojectAxisangleFullXyFn[0](pose, pt, world2lh, cal),
+					   reprojectModel->reprojectAxisangleFullXyFn[1](pose, pt, world2lh, cal + 1)};
+		for (int i = 0; i < 2; i++)
+			assert(fabs(check[i] - out[i]) < 1e-5);
+	}
+#endif
 
 	FLT MAX_DEVIATE = LINMATHPI;
-	for (int i = 0; i < 2; i++)
+	for (int i = 0; i < 2; i++) {
+		deviates[i] = (out[i] - meas[i].value) / meas[i].variance;
 		if (!isfinite(deviates[i]))
 			deviates[i] = MAX_DEVIATE;
+	}
 
 	if (derivs) {
 		int jac_offset_lh = (lh + mpfunc_ctx->poseLength) * 7;
@@ -276,7 +286,7 @@ static void run_single_measurement(survive_optimizer *mpfunc_ctx, size_t meas_id
 		FLT out[7] = {0};
 
 		if (derivs[jac_offset_obj]) {
-			reprojectModel->reprojectAxisAngleAxisJacobFn[meas->axis](out, pose, pt, world2lh, cal);
+			reprojectModel->reprojectAxisAngleAxisJacobFn[meas->axis](out, pose, pt, world2lh, cal + meas->axis);
 			for (int j = 0; j < 6; j++) {
 				assert(derivs[jac_offset_obj + j]);
 				derivs[jac_offset_obj + j][meas_idx] = isfinite(out[j]) ? out[j] : 0;
@@ -285,7 +295,7 @@ static void run_single_measurement(survive_optimizer *mpfunc_ctx, size_t meas_id
 		}
 
 		if (derivs[jac_offset_lh]) {
-			reprojectModel->reprojectAxisAngleAxisJacobLhPoseFn[meas->axis](out, pose, pt, world2lh, cal);
+			reprojectModel->reprojectAxisAngleAxisJacobLhPoseFn[meas->axis](out, pose, pt, world2lh, cal + meas->axis);
 			for (int j = 0; j < 6; j++) {
 				assert(derivs[jac_offset_lh + j]);
 				derivs[jac_offset_lh + j][meas_idx] = isfinite(out[j]) ? out[j] : 0;
@@ -293,12 +303,6 @@ static void run_single_measurement(survive_optimizer *mpfunc_ctx, size_t meas_id
 			}
 		}
 	}
-}
-static inline FLT norm_pdf(FLT x, FLT std) {
-	const FLT scale = 1. / sqrt(M_PI * 2);
-	FLT ratio = x / std;
-	ratio = (ratio * ratio) * -.5;
-	return scale * exp(ratio);
 }
 
 static void filter_measurements(survive_optimizer *optimizer, FLT *deviates) {
@@ -314,6 +318,10 @@ static void filter_measurements(survive_optimizer *optimizer, FLT *deviates) {
 	size_t valid_meas = 0;
 	for (int i = 0; i < optimizer->measurementsCnt; i++) {
 		survive_optimizer_measurement *meas = &optimizer->measurements[i];
+		SV_DATA_LOG("mpfit_meas_val[%d][%d][%d]", &meas->value, 1, meas->sensor_idx, meas->lh, meas->axis);
+		SV_DATA_LOG("mpfit_meas_var[%d][%d][%d]", &meas->variance, 1, meas->sensor_idx, meas->lh, meas->axis);
+		SV_DATA_LOG("mpfit_meas_err[%d][%d][%d]", deviates, 1, meas->sensor_idx, meas->lh, meas->axis);
+
 		avg_dev += fabs(deviates[i]);
 		valid_meas++;
 	}
@@ -325,9 +333,9 @@ static void filter_measurements(survive_optimizer *optimizer, FLT *deviates) {
 	}
 	for (int i = 0; i < optimizer->measurementsCnt; i++) {
 		survive_optimizer_measurement *meas = &optimizer->measurements[i];
-		FLT P = norm_pdf(deviates[i], avg_dev);
+		FLT P = linmath_norm_pdf(deviates[i], 0, avg_dev);
 		FLT chauvenet_criterion = P * optimizer->measurementsCnt;
-		if (chauvenet_criterion < .5) {
+		if (chauvenet_criterion < .5 && false) {
 			meas->invalid = true;
 			optimizer->stats.dropped_meas_cnt++;
 
@@ -377,7 +385,7 @@ static void filter_measurements(survive_optimizer *optimizer, FLT *deviates) {
 
 			FLT corrected_dev = unbias_dev - lh_deviates[i] / (obs_lhs - 1.);
 			SV_DATA_LOG("opt_lh_corrected_dev[%d]", &corrected_dev, 1, i);
-			FLT P = norm_pdf(lh_deviates[i], lh_avg_dev);
+			FLT P = linmath_norm_pdf(lh_deviates[i], 0, lh_avg_dev);
 			FLT chauvenet_criterion = P * obs_lhs;
 
 			if (lh_deviates[i] > 100 * corrected_dev) {
@@ -423,18 +431,20 @@ static int mpfunc(int m, int n, FLT *p, FLT *deviates, FLT **derivs, void *priva
 	LinmathAxisAnglePose obj2lh[NUM_GEN2_LIGHTHOUSES] = {0};
 
 	int meas_count = m;
+
+	int light_meas = mpfunc_ctx->measurementsCnt;
 	if (mpfunc_ctx->current_bias > 0) {
-		meas_count -= 7;
+		light_meas -= 7;
 		FLT *pp = (FLT *)mpfunc_ctx->initialPose.Pos;
 		for (int i = 0; i < 7; i++) {
-			deviates[i + meas_count] = (p[i] - pp[i]) * mpfunc_ctx->current_bias;
-			if (derivs) {
-				derivs[i][i + meas_count] = mpfunc_ctx->current_bias;
+			deviates[i + light_meas] = (p[i] - pp[i]) * mpfunc_ctx->current_bias;
+			if (derivs && derivs[i]) {
+				derivs[i][i + light_meas] = mpfunc_ctx->current_bias;
 			}
 		}
 	}
 
-	for (int i = 0; i < meas_count; i++) {
+	for (int i = 0; i < light_meas; i++) {
 		const survive_optimizer_measurement *meas = &mpfunc_ctx->measurements[i];
 		const int lh = meas->lh;
 		const FLT *sensor_points = survive_optimizer_get_sensors(mpfunc_ctx, meas->object);
@@ -475,9 +485,6 @@ static int mpfunc(int m, int n, FLT *p, FLT *deviates, FLT **derivs, void *priva
 		const bool nextIsPair = i + 1 < m && meas[0].axis == 0 && meas[1].axis == 1 &&
 								meas[0].sensor_idx == meas[1].sensor_idx && !meas[1].invalid;
 
-		LinmathPoint3d sensorPtInLH;
-		ApplyAxisAnglePoseToPoint(sensorPtInLH, &obj2lh[lh], pt);
-
 		if (nextIsPair) {
 			run_pair_measurement(mpfunc_ctx, i, reprojectModel, meas, pose, &obj2lh[lh], world2lh, deviates + i,
 								 derivs);
@@ -488,6 +495,41 @@ static int mpfunc(int m, int n, FLT *p, FLT *deviates, FLT **derivs, void *priva
 		}
 	}
 
+	for (size_t up_idx = 0; up_idx < meas_count - mpfunc_ctx->measurementsCnt; up_idx++) {
+		LinmathPoint3d up = {0};
+		LinmathAxisAngle rot = {};
+		size_t m_idx = up_idx + mpfunc_ctx->measurementsCnt;
+
+		FLT bias = mpfunc_ctx->upVectorBias / (mpfunc_ctx->poseLength + mpfunc_ctx->cameraLength);
+		FLT deriv[3] = {0}, error = 0;
+		size_t deriv_idx = 0;
+
+		if (up_idx < mpfunc_ctx->poseLength) {
+			LinmathAxisAnglePose *pose = (LinmathAxisAnglePose *)(&survive_optimizer_get_pose(mpfunc_ctx)[up_idx]);
+			copy3d(up, mpfunc_ctx->obj_up_vectors[up_idx]);
+			copy3d(rot, pose->AxisAngleRot);
+
+			error = gen_obj2world_aa_up_err(pose->AxisAngleRot, up);
+			deriv_idx = up_idx * 7 + 3;
+			gen_obj2world_aa_up_err_jac_axis_angle(deriv, pose->AxisAngleRot, up);
+		} else {
+			size_t lh = up_idx - mpfunc_ctx->poseLength;
+			normalize3d(up, mpfunc_ctx->obj_up_vectors[up_idx]);
+
+			LinmathAxisAnglePose *world2lh = (LinmathAxisAnglePose *)&cameras[lh];
+			scale3d(rot, world2lh->AxisAngleRot, -1);
+
+			deriv_idx = survive_optimizer_get_camera_index(mpfunc_ctx) + lh * 7 + 3;
+			if (isfinite(up[0])) {
+				error = gen_world2lh_aa_up_err(world2lh->AxisAngleRot, up);
+				gen_world2lh_aa_up_err_jac_axis_angle(deriv, world2lh->AxisAngleRot, up);
+			}
+		}
+		deviates[m_idx] = bias * error;
+		for (int i = 0; i < 3 && derivs && derivs[deriv_idx + i]; i++) {
+			derivs[deriv_idx + i][m_idx] = bias * deriv[i];
+		}
+	}
 	if (mpfunc_ctx->needsFiltering) {
 		assert(derivs == 0);
 		filter_measurements(mpfunc_ctx, deviates);
@@ -590,7 +632,8 @@ int survive_optimizer_run(survive_optimizer *optimizer, struct mp_result_struct 
 	// MPFit runs on temporary storage; so parameters is manipulated in mpfunc. Save it and restore it here.
 	FLT *params = optimizer->parameters;
 	optimizer->needsFiltering = !optimizer->nofilter;
-	int rtn = mpfit(mpfunc, optimizer->measurementsCnt, survive_optimizer_get_parameters_count(optimizer),
+	size_t extra_meas = optimizer->upVectorBias > 0 ? (optimizer->cameraLength + optimizer->poseLength) : 0;
+	int rtn = mpfit(mpfunc, optimizer->measurementsCnt + extra_meas, survive_optimizer_get_parameters_count(optimizer),
 					optimizer->parameters, optimizer->parameters_info, cfg, optimizer, result);
 	optimizer->parameters = params;
 
@@ -620,7 +663,7 @@ void survive_optimizer_serialize(const survive_optimizer *opt, const char *fn) {
 	fprintf(f, "object       %s\n", opt->sos[0]->codename);
 	fprintf(f, "currentBias  %+0.16f\n", opt->current_bias);
 	fprintf(f, "initialPose " SurvivePose_format "\n", SURVIVE_POSE_EXPAND(opt->initialPose));
-	fprintf(f, "model        %d\n", opt->reprojectModel != &survive_reproject_model);
+	fprintf(f, "model        %d\n", opt->reprojectModel != &survive_reproject_gen1_model);
 	fprintf(f, "poseLength   %d\n", opt->poseLength);
 	fprintf(f, "cameraLength %d\n", opt->cameraLength);
 	fprintf(f, "ptsLength    %d\n", opt->ptsLength);
@@ -674,7 +717,7 @@ survive_optimizer *survive_optimizer_load(const char *fn) {
 	read_count = fscanf(f, "initialPose " SurvivePose_sformat "\n", SURVIVE_POSE_SCAN_EXPAND(opt->initialPose));
 	int model = 0;
 	read_count = fscanf(f, "model        %d\n", &model);
-	opt->reprojectModel = model == 0 ? &survive_reproject_model : &survive_reproject_gen2_model;
+	opt->reprojectModel = model == 0 ? &survive_reproject_gen1_model : &survive_reproject_gen2_model;
 	read_count = fscanf(f, "poseLength   %d\n", &opt->poseLength);
 	read_count = fscanf(f, "cameraLength %d\n", &opt->cameraLength);
 	read_count = fscanf(f, "ptsLength    %d\n", &opt->ptsLength);
@@ -809,8 +852,11 @@ SURVIVE_EXPORT void survive_optimizer_setup_buffers(survive_optimizer *ctx, void
 	memset(so_buffer, 0, sizeof(SurviveObject *) * ctx->poseLength);
 
 	ctx->measurements = (survive_optimizer_measurement *)(measurements_buffer);
-	memset(ctx->measurements, 0,
-		   ctx->poseLength * sizeof(survive_optimizer_measurement) * 2 * sensor_cnt * NUM_GEN2_LIGHTHOUSES);
+	size_t measurementAllocSize =
+		ctx->poseLength * sizeof(survive_optimizer_measurement) * 2 * sensor_cnt * NUM_GEN2_LIGHTHOUSES;
+	memset(ctx->measurements, 0, measurementAllocSize);
+	ctx->obj_up_vectors = measurements_buffer + measurementAllocSize;
+	ctx->cam_up_vectors = ctx->obj_up_vectors + ctx->poseLength;
 	memset(ctx->parameters_info, 0, sizeof(mp_par) * par_count);
 	for (int i = 0; i < survive_optimizer_get_parameters_count(ctx); i++) {
 		ctx->parameters_info[i].fixed = 1;

@@ -1,14 +1,3 @@
-// Unofficial driver for the official Valve/HTC Vive hardware.
-//
-// Based off of https://github.com/collabora/OSVR-Vive-Libre
-// Originally Copyright 2016 Philipp Zabel
-// Originally Copyright 2016 Lubosz Sarnecki <lubosz.sarnecki@collabora.co.uk>
-// Originally Copyright (C) 2013 Fredrik Hultin
-// Originally Copyright (C) 2013 Jakob Bornecrantz
-//
-// But, re-written as best as I can to get it put under an open souce license instead of a forced-source license.
-// If there are portions of the code too similar to the original, I would like to know  so they can be re-written.
-// All MIT/x11 Licensed Code in this file may be relicensed freely under the GPL or LGPL licenses.
 #include <errno.h>
 #include <jsmn.h>
 #include <os_generic.h>
@@ -868,8 +857,8 @@ int survive_vive_usb_poll(SurviveContext *ctx, void *v) {
 	for (int i = 0; i < sv->udev_cnt; i++) {
 		struct SurviveUSBInfo *usbInfo = sv->udev[i];
 
-		if ((usbInfo->device_info->pid == 0x2102 || usbInfo->device_info->pid == 0x2101) && usbInfo->so &&
-			usbInfo->so->conf == 0 && sv->requestPairing && (sv->lastPairTime + 1) < now && now > 3) {
+		if ((usbInfo->device_info->pid == 0x2102 || usbInfo->device_info->pid == 0x2101) && usbInfo->so == 0 &&
+			sv->requestPairing && (sv->lastPairTime + 1) < now && now > 3) {
 			survive_release_ctx_lock(ctx);
 			int r = update_feature_report(usbInfo->handle, 0, vive_request_pairing, sizeof(vive_request_pairing));
 			survive_get_ctx_lock(ctx);
@@ -1014,7 +1003,8 @@ static ButtonQueueEntry *incrementAndPostButtonQueue(SurviveObject *so) {
 		return 0;
 
 	ButtonQueueEntry *entry = &(ctx->buttonQueue.entry[ctx->buttonQueue.nextWriteIndex]);
-	SV_VERBOSE(100, "%s Button event %s %d %s %f", survive_colorize_codename(so),
+
+	SV_VERBOSE(110, "%s Button event %s %d %s %f", survive_colorize_codename(so),
 			   SurviveInputEventStr(entry->eventType), entry->buttonId,
 			   SurviveAxisStr(so->object_subtype, entry->ids[0]), entry->axisValues[0]);
 
@@ -1704,7 +1694,7 @@ static void handle_battery(SurviveObject *w, uint8_t batStatus) {
 		w->charging = charging;
 		w->charge = percent;
 		SurviveContext *ctx = w->ctx;
-		SV_VERBOSE(100, "%s Battery charge %d%%(%s)", w->codename, percent, charging ? "Charging" : "Not charging");
+		SV_VERBOSE(110, "%s Battery charge %d%%(%s)", w->codename, percent, charging ? "Charging" : "Not charging");
 	}
 }
 
@@ -2648,6 +2638,9 @@ static void parse_tracker_version_info(SurviveObject *so, uint8_t *data, size_t 
 	char fw_name[33] = {0};
 	memcpy(&version_info, data, sizeof(version_info));
 	memcpy(fw_name, version_info.fw_name, 32);
+	for (int i = 0; i < 32; i++) {
+		fw_name[i] = 0x7f & fw_name[i];
+	}
 
 	SV_INFO("Device %s has watchman FW version %u and FPGA version %u/%u/%u; named '%31s'. Hardware id 0x%08x",
 			survive_colorize(so->codename), version_info.revision, version_info.fpga_major_version,
@@ -2836,9 +2829,9 @@ void survive_data_cb_locked(uint64_t time_received_us, SurviveUSBInterface *si) 
 				le.timestamp = POP4;
 				if (le.sensor_id > 0xfd)
 					continue;
-				SV_VERBOSE(300, "%s %s %7.3f %2u %2u %5u %08x %4d", survive_colorize(obj->codename),
-						   survive_colorize("LIGHTCAP"), le.timestamp / 48000000., id, le.sensor_id, le.length,
-						   le.timestamp, (int)(si->buffer + size - readdata));
+				SV_VERBOSE(300, "%s %s %7.6f %7.6f %2u %2u %5u %08x %4d", survive_colorize(obj->codename),
+						   survive_colorize("LIGHTCAP"), survive_run_time(ctx), le.timestamp / 48000000., id,
+						   le.sensor_id, le.length, le.timestamp, (int)(si->buffer + size - readdata));
 
 				if (obj->ctx->lh_version != 1) {
 					bool success = handle_lightcap(obj, &le);

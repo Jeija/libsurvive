@@ -68,12 +68,14 @@ static void print_array(const char *label, const FLT *a, size_t t, size_t column
 	if (label)
 		TEST_PRINTF("%32s: \t", label);
 	for (int i = 0; i < t; i++) {
-		if (a[i] == 0.0 || (fabs(a[i]) > .000001 && fabs(a[i]) < 1e4))
+		if ((fabs(a[i]) > .000001 && fabs(a[i]) < 1e4))
 			TEST_PRINTF("%+6.6lf"
 						"\t",
 						(double)a[i]);
 		else if (isnan(a[i])) {
 			TEST_PRINTF("%6snan\t", "");
+		} else if (a[i] == 0) {
+			TEST_PRINTF("        0\t");
 		} else {
 			TEST_PRINTF("%+2.3le\t", (double)a[i]);
 		}
@@ -104,6 +106,7 @@ static FLT test_gen_jacobian_function(const char *name, generate_input input_fn,
 									  size_t jac_length) {
 	size_t inputs = input_fn(0) / sizeof(FLT);
 	FLT *output_gen = STACK_ALLOC(outputs * jac_length), *output = STACK_ALLOC(outputs * jac_length);
+	bool failed = false;
 
 	FLT *input = STACK_ALLOC(inputs);
 	for (int n = 0; n < inputs; n++) {
@@ -150,13 +153,18 @@ static FLT test_gen_jacobian_function(const char *name, generate_input input_fn,
 						int s = n == 0 ? 1 : -1;
 						input_copy[jac_start_idx + i] += s * H;
 						// print_array("Input", input_copy, inputs, 0);
-						nongen(n == 0 ? out : out_pt, input_copy);
-						gen(gen_output, input_copy);
-						FLT err = diff_array(0, gen_output, n == 0 ? out : out_pt, outputs);
-						if (err > 1e-5) {
-							TEST_PRINTF("Gen/nongen mismatch\n");
-						}
+						if (nongen) {
+							nongen(n == 0 ? out : out_pt, input_copy);
+							gen(gen_output, input_copy);
 
+							FLT err = diff_array(0, gen_output, n == 0 ? out : out_pt, outputs);
+							if (err > 1e-5) {
+								failed = true;
+								TEST_PRINTF("Gen/nongen mismatch\n");
+							}
+						} else {
+							gen(n == 0 ? out : out_pt, input_copy);
+						}
 						// print_array("Output", n == 0 ? out : out_pt, outputs, 0);
 					}
 
@@ -180,15 +188,18 @@ static FLT test_gen_jacobian_function(const char *name, generate_input input_fn,
 		}
 	}
 
-	TEST_PRINTF("Testing generated jacobian %s\n", name);
-	print_array("inputs", input, inputs, 0);
+	if (failed) {
+		TEST_PRINTF("Testing generated jacobian %s\n", name);
+		print_array("inputs", input, inputs, 0);
 
-	print_array("gen jacobian outputs", output_gen, outputs * jac_length, jac_length);
-	print_array("jacobian outputs", output, outputs * jac_length, jac_length);
+		print_array("gen jacobian outputs", output_gen, outputs * jac_length, jac_length);
+		print_array("jacobian outputs", output, outputs * jac_length, jac_length);
 
-	FLT err = print_diff_array("Differences", output, output_gen, outputs * jac_length, jac_length);
-	TEST_PRINTF("SSE: %f\n", err);
-	return err;
+		FLT err = print_diff_array("Differences", output, output_gen, outputs * jac_length, jac_length);
+		TEST_PRINTF("SSE: %f\n", err);
+		return err;
+	}
+	return 0;
 }
 
 typedef struct gen_function_jacobian_def {
@@ -223,6 +234,11 @@ static double run_cycles(general_fn runme, const FLT *inputs, FLT *outputs) {
 
 static FLT test_gen_function(const char *name, generate_input input_fn, general_fn nongen, general_fn generated,
 							 size_t outputs) {
+	if (!nongen) {
+		printf("Testing generated %-32s \n", name);
+		return 0;
+	}
+
 	FLT *output_gen = STACK_ALLOC(outputs), *output = STACK_ALLOC(outputs);
 
 	size_t inputs = input_fn(0) / sizeof(FLT);
@@ -236,6 +252,7 @@ static FLT test_gen_function(const char *name, generate_input input_fn, general_
 		nongen(output, input);
 
 		FLT err = diff_array(0, output, output_gen, outputs);
+		TEST_PRINTF("%s match\n", name);
 		if (err > 1e-5) {
 			TEST_PRINTF("%s eval mismatch: \n", name);
 			print_array("inputs", input, inputs, 0);
@@ -273,8 +290,10 @@ static int test_gen_function_def(const gen_function_def *def) {
 		strcat(name, def->name);
 		strcat(name, "_");
 		strcat(name, jdef->suffix);
-		failed |= test_gen_jacobian_function(name, def->generate_inputs, def->check, def->generated, jdef->jacobian,
-											 def->outputs, jdef->jacobian_start_idx, jdef->jacobian_length) > 1e-5;
+		for (int j = 0; j < 100; j++) {
+			failed |= test_gen_jacobian_function(name, def->generate_inputs, def->check, def->generated, jdef->jacobian,
+												 def->outputs, jdef->jacobian_start_idx, jdef->jacobian_length) > 1e-5;
+		}
 	}
 	return failed ? -1 : 0;
 }
@@ -375,48 +394,118 @@ void random_fcal(BaseStationCal *fcal) {
 	fcal->tilt = next_rand(0.5);
 }
 
+size_t random_kalman_model(FLT *out) {
+	if (out != 0) {
+		SurviveKalmanModel m = {
+			.Pose = random_pose(),
+		};
+		random_point(m.Acc);
+		random_point(m.Velocity.Pos);
+		random_point(m.Velocity.AxisAngleRot);
+		memcpy(out, &m, sizeof(SurviveKalmanModel));
+	}
+	return sizeof(SurviveKalmanModel);
+}
+
+static void general_imu_predict(FLT *out, const FLT *_input) {
+	SurviveKalmanModel *input = (SurviveKalmanModel *)_input;
+	gen_imu_predict(out, input);
+}
+
+static void general_gen_imu_predict_jac_kalman_model(FLT *out, const FLT *_input) {
+	SurviveKalmanModel *input = (SurviveKalmanModel *)_input;
+	gen_imu_predict_jac_kalman_model(out, input);
+}
+
+static void imu_predict_gyro(FLT *out, SurviveKalmanModel *m) {
+	/*
+	 * def imu_predict_gyro(kalman_model):
+		rot = quatgetreciprocal(quatnormalize(kalman_model.Pose.Rot))
+		rotv = quatrotatevector(rot, kalman_model.Velocity.Rot)
+		return [rotv[0] + kalman_model.GyroBias[0],
+				rotv[1] + kalman_model.GyroBias[1],
+				rotv[2] + kalman_model.GyroBias[2]
+		]
+	 */
+	LinmathQuat w2o;
+	quatgetreciprocal(w2o, m->Pose.Rot);
+	quatrotatevector(out, w2o, m->Velocity.AxisAngleRot);
+	add3d(out, out, m->GyroBias);
+}
+static void imu_predict_up(FLT *out, SurviveKalmanModel *m) {
+	/*
+	 *     g = 9.80665
+		G = [ kalman_model.Acc[0]/g, kalman_model.Acc[1]/g, 1 + kalman_model.Acc[2]/g]
+		rot = quatgetreciprocal(quatnormalize(kalman_model.Pose.Rot))
+		return quatrotatevector(rot, G)
+
+	 */
+	FLT g = 9.80665;
+	FLT accInWorld[3] = {0, 0, 1};
+	FLT accInG[3];
+	scale3d(accInG, m->Acc, 1. / g);
+	add3d(accInWorld, accInWorld, accInG);
+
+	LinmathQuat w2o;
+	quatgetreciprocal(w2o, m->Pose.Rot);
+
+	quatrotatevector(out, w2o, accInWorld);
+	for (int i = 0; i < 3; i++)
+		out[i] += m->AccBias[i];
+}
+
+static void imu_predict(FLT *out, const FLT *m) {
+	/*
+	def imu_predict(kalman_model):
+	return [*imu_predict_up(kalman_model), *imu_predict_gyro(kalman_model)]
+	*/
+	imu_predict_up(out, (SurviveKalmanModel *)m);
+	imu_predict_gyro(out + 3, (SurviveKalmanModel *)m);
+}
+
+gen_function_def imu_predict_def = {.name = "imu_predict",
+									.generated = general_imu_predict,
+									.generate_inputs = random_kalman_model,
+									.check = imu_predict,
+									.outputs = 6,
+									.jacobians = {
+										{.suffix = "kalman_model",
+										 .jacobian = general_gen_imu_predict_jac_kalman_model,
+										 .jacobian_length = sizeof(SurviveKalmanModel) / sizeof(FLT)},
+									}};
+
+TEST(Generated, imu_predict) {
+	SurviveKalmanModel m = {.Pose = {.Rot = {1}}, .Acc = {0, 0, 9.80665}};
+
+	{
+		FLT imu[6] = {0};
+		FLT imu_gt[6] = {0, 0, 2, 0, 0, 0};
+		imu_predict_up(imu, &m);
+		ASSERT_DOUBLE_ARRAY_EQ(6, imu, imu_gt);
+	}
+	{
+		m.Acc[2] = 0;
+		FLT imu[6] = {0};
+		FLT imu_gt[6] = {0, 0, 1, 0, 0, 0};
+		imu_predict_up(imu, &m);
+		ASSERT_DOUBLE_ARRAY_EQ(6, imu, imu_gt);
+	}
+	{
+		m.Acc[2] = -9.80665;
+		FLT imu[6] = {0};
+		FLT imu_gt[6] = {0, 0, 0, 0, 0, 0};
+		imu_predict_up(imu, &m);
+		ASSERT_DOUBLE_ARRAY_EQ(6, imu, imu_gt);
+	}
+	return test_gen_function_def(&imu_predict_def);
+}
+
 void print_pose(const SurvivePose *pose) {
 	TEST_PRINTF("[%f %f %f] [%f %f %f %f]\n", pose->Pos[0], pose->Pos[1], pose->Pos[2], pose->Rot[0], pose->Rot[1],
 				pose->Rot[2], pose->Rot[3]);
 }
 
 void print_point(const FLT *Pos) { TEST_PRINTF("[%f %f %f]\n", Pos[0], Pos[1], Pos[2]); }
-
-#ifdef HAVE_AUX_GENERATED
-void check_rotate_vector() {
-	SurvivePose obj = random_pose();
-	FLT pt[3];
-	random_point(pt);
-
-	int cycles = 1000;
-	FLT gen_out[3], out[3];
-	double start, stop;
-	start = OGGetAbsoluteTime();
-	for (int i = 0; i < cycles; i++) {
-		gen_quatrotatevector(gen_out, obj.Rot, pt);
-	}
-	stop = OGGetAbsoluteTime();
-	TEST_PRINTF("gen: %f %f %f (%f)\n", gen_out[0], gen_out[1], gen_out[2], stop - start);
-
-	start = OGGetAbsoluteTime();
-	for (int i = 0; i < cycles; i++) {
-		quatrotatevector(out, obj.Rot, pt);
-	}
-	stop = OGGetAbsoluteTime();
-
-	TEST_PRINTF("%f %f %f (%f)\n", out[0], out[1], out[2], stop - start);
-}
-
-void check_invert() {
-	SurvivePose obj = random_pose();
-	SurvivePose gen_inv, inv;
-	gen_invert_pose(gen_inv.Pos, &obj);
-	InvertPose(&inv, &obj);
-
-	print_pose(&gen_inv);
-	print_pose(&inv);
-}
-#endif
 
 TEST(Generated, reproject_gen2_vals) {
 	BaseStationData bsd = { 0 };
@@ -456,6 +545,21 @@ void check_apply_ang_velocity() {
 #endif
 
 extern void rot_predict_quat(FLT t, const void *k, const SvMat *f_in, SvMat *f_out);
+
+TEST(Generated, imu_predict_up) {
+	SurviveKalmanModel model = {.Pose = {.Rot = {1}}};
+	FLT accel[3] = {linmath_rand(-1, 1), linmath_rand(-1, 1), linmath_rand(-1, 1)};
+	normalize3d(accel, accel);
+
+	LinmathVec3d up = {0, 0, 1};
+	quatfrom2vectors(model.Pose.Rot, accel, up);
+
+	FLT accel_out[3];
+	gen_imu_predict_up(accel_out, &model); // gen_imu_predict_up(accel_out, &model);
+
+	ASSERT_DOUBLE_ARRAY_EQ(3, accel, accel_out);
+	return 0;
+}
 
 TEST(Generated, rot_predict_quat) {
 	FLT _mi[7] = { 0 };
@@ -535,6 +639,115 @@ size_t generate_reproject_input(FLT *out) {
 	return sizeof(struct reproject_input);
 }
 
+struct reproject_input_axisangle {
+	LinmathAxisAnglePose p;
+	BaseStationCal fcal[2];
+	LinmathAxisAnglePose  world2lh;
+	LinmathPoint3d pt;
+};
+size_t generate_pose(FLT* out) {
+	if (out != 0) {
+		SurvivePose * p = (SurvivePose *)out;
+		*p = random_pose();
+	}
+	return sizeof(SurvivePose);
+}
+size_t generate_reproject_input_axisangle(FLT *out) {
+	if (out != 0) {
+		struct reproject_input _s;
+		generate_reproject_input((FLT*)&_s);
+
+		struct reproject_input_axisangle *s = (struct reproject_input_axisangle *)out;
+		memcpy(s->pt, _s.pt, sizeof(s->pt));
+		memcpy(s->fcal, _s.fcal, sizeof(s->fcal));
+		memcpy(s->p.Pos, _s.p.Pos, sizeof(s->p.Pos));
+		memcpy(s->world2lh.Pos, _s.p.Pos, sizeof(s->world2lh.Pos));
+		quattoaxisanglemag(s->p.AxisAngleRot, _s.p.Rot);
+		quattoaxisanglemag(s->world2lh.AxisAngleRot, _s.world2lh.Rot);
+
+	}
+	return sizeof(struct reproject_input_axisangle);
+}
+
+
+static void general_gen_reproject_x_gen2(FLT *out, const FLT *_input) {
+	struct reproject_input *input = (struct reproject_input *)_input;
+	*out = gen_reproject_axis_x_gen2(&input->p, input->pt, &input->world2lh, input->fcal);
+}
+static void general_gen_reproject_y_gen2(FLT *out, const FLT *_input) {
+	struct reproject_input *input = (struct reproject_input *)_input;
+	*out = gen_reproject_axis_y_gen2(&input->p, input->pt, &input->world2lh, input->fcal + 1);
+}
+
+static void general_gen_reproject_x(FLT *out, const FLT *_input) {
+	struct reproject_input *input = (struct reproject_input *)_input;
+	*out = gen_reproject_axis_x(&input->p, input->pt, &input->world2lh, input->fcal);
+}
+static void general_gen_reproject_y(FLT *out, const FLT *_input) {
+	struct reproject_input *input = (struct reproject_input *)_input;
+	*out = gen_reproject_axis_y(&input->p, input->pt, &input->world2lh, input->fcal + 1);
+}
+
+static void general_gen_reproject_x_gen2_jac_obj(FLT *out, const FLT *_input) {
+	struct reproject_input *input = (struct reproject_input *)_input;
+	gen_reproject_axis_x_gen2_jac_obj_p(out, &input->p, input->pt, &input->world2lh, input->fcal);
+}
+static void general_gen_reproject_y_gen2_jac_obj(FLT *out, const FLT *_input) {
+	struct reproject_input *input = (struct reproject_input *)_input;
+	gen_reproject_axis_y_gen2_jac_obj_p(out, &input->p, input->pt, &input->world2lh, input->fcal + 1);
+}
+static void general_gen_reproject_x_jac_obj(FLT *out, const FLT *_input) {
+	struct reproject_input *input = (struct reproject_input *)_input;
+	gen_reproject_axis_x_jac_obj_p(out, &input->p, input->pt, &input->world2lh, input->fcal);
+}
+static void general_gen_reproject_y_jac_obj(FLT *out, const FLT *_input) {
+	struct reproject_input *input = (struct reproject_input *)_input;
+	gen_reproject_axis_y_jac_obj_p(out, &input->p, input->pt, &input->world2lh, input->fcal + 1);
+}
+static void general_reproject_x_gen2(FLT *out, const FLT *_input) {
+	struct reproject_input *input = (struct reproject_input *)_input;
+
+	LinmathVec3d world_pt;
+	ApplyPoseToPoint(world_pt, &input->p, input->pt);
+
+	LinmathPoint3d t_pt;
+	ApplyPoseToPoint(t_pt, &input->world2lh, world_pt);
+
+	*out = survive_reproject_axis_x_gen2(input->fcal, t_pt);
+}
+static void general_reproject_y_gen2(FLT *out, const FLT *_input) {
+	struct reproject_input *input = (struct reproject_input *)_input;
+
+	LinmathVec3d world_pt;
+	ApplyPoseToPoint(world_pt, &input->p, input->pt);
+
+	LinmathPoint3d t_pt;
+	ApplyPoseToPoint(t_pt, &input->world2lh, world_pt);
+
+	*out = survive_reproject_axis_y_gen2(input->fcal, t_pt);
+}
+static void general_reproject_x(FLT *out, const FLT *_input) {
+	struct reproject_input *input = (struct reproject_input *)_input;
+
+	LinmathVec3d world_pt;
+	ApplyPoseToPoint(world_pt, &input->p, input->pt);
+
+	LinmathPoint3d t_pt;
+	ApplyPoseToPoint(t_pt, &input->world2lh, world_pt);
+
+	*out = survive_reproject_axis_x(input->fcal, t_pt);
+}
+static void general_reproject_y(FLT *out, const FLT *_input) {
+	struct reproject_input *input = (struct reproject_input *)_input;
+
+	LinmathVec3d world_pt;
+	ApplyPoseToPoint(world_pt, &input->p, input->pt);
+
+	LinmathPoint3d t_pt;
+	ApplyPoseToPoint(t_pt, &input->world2lh, world_pt);
+
+	*out = survive_reproject_axis_y(input->fcal, t_pt);
+}
 static void general_gen_reproject(FLT *out, const FLT *_input) {
 	// static inline void gen_reproject(FLT* out, const SurvivePose* obj_p, const FLT* sensor_pt, const SurvivePose*
 	// lh_p, const BaseStationCal* bsd) {
@@ -588,7 +801,18 @@ gen_function_def reproject_gen2_def = {
 	.outputs = 2,
 	.jacobians = {{.suffix = "obj", .jacobian = general_gen_reproject_gen2_jac_obj, .jacobian_length = 7}}};
 
-TEST(Generated, reproject_gen2) { return test_gen_function_def(&reproject_gen2_def); }
+TEST(Generated, reproject_gen2) {
+	FLT inputs[] = {+4.532471, +1.504555, +2.278860, +0.553159, +0.464419, +0.401467, -0.563165, +0.164194,
+					+0.124270, +0.005944, -0.246393, -0.103026, +0.180054, +0.215506, -0.161558, +0.108294,
+					+0.211122, +0.026800, +0.238683, +0.117266, -0.091412, +2.128406, +3.859190, -4.102889,
+					+0.281242, -0.174546, -0.361296, -0.871723, +0.375631, +0.393990, -0.180330};
+	FLT out[2], out_gen[2];
+
+	general_gen_reproject_y_gen2(out_gen, inputs);
+	general_reproject_y_gen2(out, inputs);
+
+	return test_gen_function_def(&reproject_gen2_def);
+}
 
 #ifdef HAVE_AUX_GENERATED
 void check_apply_pose() {
@@ -600,30 +824,9 @@ void check_apply_pose() {
 	ApplyPoseToPoint(gen_out, &obj, pt);
 
 	print_point(out);
-	print_point(gen_out);	
+	print_point(gen_out);
 }
 #endif
-
-static void general_gen_reproject_x_gen2(FLT *out, const FLT *_input) {
-	struct reproject_input *input = (struct reproject_input *)_input;
-	*out = gen_reproject_axis_x_gen2(&input->p, input->pt, &input->world2lh, input->fcal);
-}
-
-static void general_gen_reproject_x_gen2_jac_obj(FLT *out, const FLT *_input) {
-	struct reproject_input *input = (struct reproject_input *)_input;
-	gen_reproject_axis_x_gen2_jac_obj_p(out, &input->p, input->pt, &input->world2lh, input->fcal);
-}
-static void general_reproject_x_gen2(FLT *out, const FLT *_input) {
-	struct reproject_input *input = (struct reproject_input *)_input;
-
-	LinmathVec3d world_pt;
-	ApplyPoseToPoint(world_pt, &input->p, input->pt);
-
-	LinmathPoint3d t_pt;
-	ApplyPoseToPoint(t_pt, &input->world2lh, world_pt);
-
-	*out = survive_reproject_axis_x_gen2(input->fcal, t_pt);
-}
 
 gen_function_def reproject_axis_x_gen2_def = {
 	.name = "reproject_axis_x_gen2",
@@ -635,4 +838,132 @@ gen_function_def reproject_axis_x_gen2_def = {
 		{.suffix = "obj", .jacobian = general_gen_reproject_x_gen2_jac_obj, .jacobian_length = 7},
 	}};
 
-TEST(Generated, reproject_axis_x) { return test_gen_function_def(&reproject_axis_x_gen2_def); }
+TEST(Generated, reproject_axis_x_gen2) { return test_gen_function_def(&reproject_axis_x_gen2_def); }
+
+gen_function_def reproject_axis_y_gen2_def = {
+	.name = "reproject_axis_y_gen2",
+	.generated = general_gen_reproject_y_gen2,
+	.check = general_reproject_y_gen2,
+	.generate_inputs = generate_reproject_input,
+	.outputs = 1,
+	.jacobians = {
+		{.suffix = "obj", .jacobian = general_gen_reproject_y_gen2_jac_obj, .jacobian_length = 7},
+	}};
+
+TEST(Generated, reproject_axis_y_gen2) { return test_gen_function_def(&reproject_axis_y_gen2_def); }
+
+gen_function_def reproject_axis_x_def = {
+	.name = "reproject_axis_x",
+	.generated = general_gen_reproject_x,
+	.check = general_reproject_x,
+	.generate_inputs = generate_reproject_input,
+	.outputs = 1,
+	.jacobians = {
+		{.suffix = "obj", .jacobian = general_gen_reproject_x_jac_obj, .jacobian_length = 7},
+	}};
+
+TEST(Generated, reproject_axis_x) { return test_gen_function_def(&reproject_axis_x_def); }
+
+gen_function_def reproject_axis_y_def = {
+	.name = "reproject_axis_y",
+	.generated = general_gen_reproject_y,
+	.check = general_reproject_y,
+	.generate_inputs = generate_reproject_input,
+	.outputs = 1,
+	.jacobians = {
+		{.suffix = "obj", .jacobian = general_gen_reproject_y_jac_obj, .jacobian_length = 7},
+	}};
+
+TEST(Generated, reproject_axis_y) { return test_gen_function_def(&reproject_axis_y_def); }
+
+
+static void general_gen_reproject_xy(FLT *out, const FLT *_input) {
+	struct reproject_input *input = (struct reproject_input *)_input;
+	gen_reproject_xy(out, input->fcal, input->pt);
+}
+static void general_reproject_xy(FLT *out, const FLT *_input) {
+	struct reproject_input *input = (struct reproject_input *)_input;
+	survive_reproject_xy(input->fcal, input->pt, out);
+}
+
+static void general_gen_reproject_xy_jac_sensor_pt(FLT *out, const FLT *_input) {
+	struct reproject_input *input = (struct reproject_input *)_input;
+	gen_reproject_xy_jac_sensor_pt(out, input->fcal, input->pt);
+}
+
+gen_function_def reproject_xy_def = {
+	.name = "reproject_xy",
+	.generated = general_gen_reproject_xy,
+	.check = general_reproject_xy,
+	.generate_inputs = generate_reproject_input,
+	.outputs = 2,
+	.jacobians = {
+		{.suffix = "sensor_pt",
+		 .jacobian_start_idx = offsetof(struct reproject_input, pt) / sizeof(FLT),
+		 .jacobian = general_gen_reproject_xy_jac_sensor_pt, .jacobian_length = 3
+		},
+	}};
+
+TEST(Generated, reproject_xy) { return test_gen_function_def(&reproject_xy_def); }
+
+static void general_reproject_axisangle(FLT *out, const FLT *_input) {
+	struct reproject_input_axisangle *input = (struct reproject_input_axisangle *)_input;
+	survive_reproject_full_axisangle(input->fcal, &input->world2lh, &input->p, input->pt, out);
+}
+
+static void general_gen_reproject_xy_axisangle(FLT *out, const FLT *_input) {
+	struct reproject_input_axisangle *input = (struct reproject_input_axisangle *)_input;
+	gen_reproject_axis_angle(out, &input->p, input->pt, &input->world2lh, input->fcal);
+}
+static void general_gen_reproject_xy_jac_lh_axis_angle(FLT *out, const FLT *_input) {
+	struct reproject_input_axisangle *input = (struct reproject_input_axisangle *)_input;
+	gen_reproject_jac_lh_p_axis_angle(out, &input->p, input->pt, &input->world2lh, input->fcal);
+}
+static void general_gen_reproject_xy_jac_obj_axis_angle(FLT *out, const FLT *_input) {
+	struct reproject_input_axisangle *input = (struct reproject_input_axisangle *)_input;
+	gen_reproject_jac_obj_p_axis_angle(out, &input->p, input->pt, &input->world2lh, input->fcal);
+}
+
+gen_function_def reproject_axis_angle = {
+	.name = "reproject_axis_angle",
+	.generated = general_gen_reproject_xy_axisangle,
+	.check = general_reproject_axisangle,
+	.generate_inputs = generate_reproject_input_axisangle,
+	.outputs = 2,
+	.jacobians = {
+		{.suffix = "lh", .jacobian = general_gen_reproject_xy_jac_lh_axis_angle,
+		 .jacobian_start_idx = offsetof(struct reproject_input_axisangle, world2lh) / sizeof(FLT),
+		 .jacobian_length = 7},
+		{.suffix = "obj", .jacobian = general_gen_reproject_xy_jac_obj_axis_angle,
+			.jacobian_start_idx = offsetof(struct reproject_input_axisangle, p) / sizeof(FLT),
+			.jacobian_length = 7},
+	}};
+
+TEST(Generated, reproject_axisangle) { return test_gen_function_def(&reproject_axis_angle); }
+
+
+void general_invert_pose(FLT* out, const FLT* in) {
+	SurvivePose* p = (SurvivePose *)in;
+	InvertPose((LinmathPose *)out, p);
+}
+void general_gen_invert_pose(FLT* out, const FLT* in) {
+	SurvivePose* p = (SurvivePose *)in;
+	gen_invert_pose(out, p);
+}
+void general_gen_invert_pose_jac_obj_p(FLT* out, const FLT* in) {
+	SurvivePose* p = (SurvivePose *)in;
+	gen_invert_pose_jac_obj_p(out, p);
+}
+
+
+gen_function_def invert_pose_def = {
+	.name = "invert_pose",
+	.generated = general_gen_invert_pose,
+	.check = general_invert_pose,
+	.generate_inputs = generate_pose,
+	.outputs = 7,
+	.jacobians = {
+		{.suffix = "obj", .jacobian = general_gen_invert_pose_jac_obj_p, .jacobian_length = 7},
+	}};
+
+TEST(Generated, invert_pose) { return test_gen_function_def(&invert_pose_def); }

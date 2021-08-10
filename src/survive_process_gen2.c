@@ -46,8 +46,13 @@ static void ootx_packet_clbk_d_gen2(ootx_decoder_context *ct, ootx_packet *packe
 	}
 
 	BaseStationData *b = &ctx->bsd[id];
+	b->OOTXChecked |= true;
+	FLT accel[3] = {v15.accel_dir[0], v15.accel_dir[1], v15.accel_dir[2]};
+	bool upChanged = dist3d(b->accel, accel) > 1e-3;
 
-	bool doSave = b->BaseStationID != v15.id || b->OOTXSet == false;
+	b->OOTXSet = 1;
+
+	bool doSave = b->BaseStationID != v15.id || b->OOTXSet == false || upChanged;
 
 	if (doSave) {
 	  SV_INFO("Got OOTX packet %d %08x", ctx->bsd[id].mode, (unsigned)v15.id);
@@ -70,7 +75,8 @@ static void ootx_packet_clbk_d_gen2(ootx_decoder_context *ct, ootx_packet *packe
 
 		// Although we know this already....
 		b->mode = v15.mode_current & 0x7F;
-		b->OOTXSet = 1;
+
+		survive_reset_lighthouse_position(ctx, id);
 
 		SURVIVE_INVOKE_HOOK(ootx_received, ctx, id);
 	}
@@ -81,32 +87,60 @@ static void ootx_packet_cblk_d_gen1(ootx_decoder_context *ct, ootx_packet *packe
 	SurviveContext *ctx = ((SurviveObject *)(ct->user))->ctx;
 	int id = ct->user1;
 
-	SV_INFO("Got OOTX packet %d", id);
-
 	lighthouse_info_v6 v6;
 	init_lighthouse_info_v6(&v6, packet->data);
 
 	BaseStationData *b = &ctx->bsd[id];
+	b->OOTXChecked = true;
+	FLT accel[3] = {v6.accel_dir_x, v6.accel_dir_y, v6.accel_dir_z};
+	bool upChanged = dist3d(b->accel, accel) > 1e-3;
 
+	bool doSave = b->BaseStationID != v6.id || b->OOTXSet == false || upChanged || b->mode != v6.mode_current;
 	b->sys_unlock_count = v6.sys_unlock_count;
-	b->BaseStationID = v6.id;
-	b->fcal[0].phase = v6.fcal_0_phase;
-	b->fcal[1].phase = v6.fcal_1_phase;
-	b->fcal[0].tilt = tan(v6.fcal_0_tilt);
-	b->fcal[1].tilt = tan(v6.fcal_1_tilt); // XXX??? Is this right? See https://github.com/cnlohr/libsurvive/issues/18
-	b->fcal[0].curve = v6.fcal_0_curve;
-	b->fcal[1].curve = v6.fcal_1_curve;
-	b->fcal[0].gibpha = v6.fcal_0_gibphase;
-	b->fcal[1].gibpha = v6.fcal_1_gibphase;
-	b->fcal[0].gibmag = v6.fcal_0_gibmag;
-	b->fcal[1].gibmag = v6.fcal_1_gibmag;
-	b->accel[0] = v6.accel_dir_x;
-	b->accel[1] = v6.accel_dir_y;
-	b->accel[2] = v6.accel_dir_z;
-	b->mode = v6.mode_current;
 	b->OOTXSet = 1;
 
-	SURVIVE_INVOKE_HOOK(ootx_received, ctx, id);
+	if (doSave) {
+		SV_VERBOSE(50, "Got OOTX packet %d %08x", ctx->bsd[id].mode, (unsigned)v6.id);
+
+		b->BaseStationID = v6.id;
+		b->fcal[0].phase = v6.fcal_0_phase;
+		b->fcal[1].phase = v6.fcal_1_phase;
+		b->fcal[0].tilt = tan(v6.fcal_0_tilt);
+		b->fcal[1].tilt = tan(v6.fcal_1_tilt);
+		b->fcal[0].curve = v6.fcal_0_curve;
+		b->fcal[1].curve = v6.fcal_1_curve;
+		b->fcal[0].gibpha = v6.fcal_0_gibphase;
+		b->fcal[1].gibpha = v6.fcal_1_gibphase;
+		b->fcal[0].gibmag = v6.fcal_0_gibmag;
+		b->fcal[1].gibmag = v6.fcal_1_gibmag;
+		b->accel[0] = v6.accel_dir_x;
+		b->accel[1] = v6.accel_dir_y;
+		b->accel[2] = v6.accel_dir_z;
+		b->mode = v6.mode_current;
+
+		survive_reset_lighthouse_position(ctx, id);
+
+		SURVIVE_INVOKE_HOOK(ootx_received, ctx, id);
+	}
+}
+void survive_ootx_dump_decoder_context(struct SurviveContext *ctx, int bsd_idx) {
+	ootx_decoder_context *decoderContext = ctx->bsd[bsd_idx].ootx_data;
+	if (decoderContext == 0)
+		return;
+
+	SV_VERBOSE(105, "OOTX stats for LH%d (mode: %d, %u)", bsd_idx, ctx->bsd[bsd_idx].mode, ctx->bsd[bsd_idx].BaseStationID);
+	SV_VERBOSE(105, "\tBits seen:         %u (%d bytes)", decoderContext->stats.bits_seen,
+			   decoderContext->stats.bits_seen / 8);
+	SV_VERBOSE(105, "\tBad CRCs:          %u", decoderContext->stats.bad_crcs);
+	SV_VERBOSE(105, "\tBad sync bits:     %u", decoderContext->stats.bad_sync_bits);
+	SV_VERBOSE(105, "\tPackets found:     %u", decoderContext->stats.packets_found);
+	SV_VERBOSE(105, "\tPayload size:      %u", decoderContext->stats.used_bytes);
+	SV_VERBOSE(105, "\tPackage bits:      %u", decoderContext->stats.package_bits);
+	SV_VERBOSE(105, "\tGuessed bits:      %u (%5.2f%%)", decoderContext->stats.guess_bits,
+			   decoderContext->stats.guess_bits / (FLT)decoderContext->stats.package_bits * 100.);
+	FLT d = survive_run_time(ctx) - decoderContext->stats.started_s;
+	SV_VERBOSE(105, "\tTime:              %2.2f (%2.2fb/s, %2.2fb/s)", d, decoderContext->stats.bits_seen / d,
+			   decoderContext->stats.used_bytes * 8 / d);
 }
 void survive_ootx_free_decoder_context(struct SurviveContext *ctx, int bsd_idx) {
 	ootx_decoder_context *decoderContext = ctx->bsd[bsd_idx].ootx_data;
@@ -114,26 +148,13 @@ void survive_ootx_free_decoder_context(struct SurviveContext *ctx, int bsd_idx) 
 	if (decoderContext == 0)
 		return;
 
-	SV_VERBOSE(5, "OOTX stats for LH%d", bsd_idx);
-	SV_VERBOSE(5, "\tBits seen:         %u (%d bytes)", decoderContext->stats.bits_seen,
-			   decoderContext->stats.bits_seen / 8);
-	SV_VERBOSE(5, "\tBad CRCs:          %u", decoderContext->stats.bad_crcs);
-	SV_VERBOSE(5, "\tBad sync bits:     %u", decoderContext->stats.bad_sync_bits);
-	SV_VERBOSE(5, "\tPackets found:     %u", decoderContext->stats.packets_found);
-	SV_VERBOSE(5, "\tPayload size:      %u", decoderContext->stats.used_bytes);
-	SV_VERBOSE(5, "\tPackage bits:      %u", decoderContext->stats.package_bits);
-	SV_VERBOSE(5, "\tGuessed bits:      %u (%5.2f%%)", decoderContext->stats.guess_bits,
-			   decoderContext->stats.guess_bits / (FLT)decoderContext->stats.package_bits * 100.);
-	FLT d = survive_run_time(ctx) - decoderContext->stats.started_s;
-	SV_VERBOSE(5, "\tTime:              %2.2f (%2.2fb/s, %2.2fb/s)", d, decoderContext->stats.bits_seen / d,
-			   decoderContext->stats.used_bytes * 8 / d);
-
+	survive_ootx_dump_decoder_context(ctx, bsd_idx);
 	ootx_free_decoder_context(decoderContext);
 	free(decoderContext);
 }
 void survive_ootx_behavior(SurviveObject *so, int8_t bsd_idx, int8_t lh_version, int ootx) {
 	struct SurviveContext *ctx = so->ctx;
-	if (ctx->bsd[bsd_idx].OOTXSet == false) {
+	if (ctx->bsd[bsd_idx].OOTXChecked == false) {
 		ootx_decoder_context *decoderContext = ctx->bsd[bsd_idx].ootx_data;
 
 		if (decoderContext == 0) {
@@ -155,8 +176,10 @@ void survive_ootx_behavior(SurviveObject *so, int8_t bsd_idx, int8_t lh_version,
 		if (decoderContext->user == so) {
 			ootx_pump_bit(decoderContext, ootx);
 
-			if (ctx->bsd[bsd_idx].OOTXSet) {
-				survive_ootx_free_decoder_context(ctx, bsd_idx);
+			if (ctx->bsd[bsd_idx].OOTXChecked) {
+				ctx->bsd[bsd_idx].OOTXChecked = false;
+				survive_ootx_dump_decoder_context(ctx, bsd_idx);
+				// survive_ootx_free_decoder_context(ctx, bsd_idx);
 			}
 		}
 	}
@@ -238,6 +261,7 @@ SURVIVE_EXPORT void survive_default_sync_process(SurviveObject *so, survive_chan
 	so->stats.hit_from_lhs[bsd_idx]++;
 
 	if (ctx->lh_version != -1) {
+		survive_kalman_tracker_integrate_light(so->tracker, &l.common);
 		SURVIVE_POSER_INVOKE(so, &l);
 	}
 }

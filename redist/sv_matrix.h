@@ -124,7 +124,7 @@ static inline void sv_set_constant(struct SvMat *m, FLT v) {
 		SV_FLT_PTR(m)[i] = v;
 }
 
-static inline bool sv_is_finite(struct SvMat *m) {
+static inline bool sv_is_finite(const struct SvMat *m) {
 	for (int i = 0; i < m->rows * m->cols; i++)
 		if (!isfinite(SV_FLT_PTR(m)[i]))
 			return false;
@@ -212,6 +212,11 @@ static inline void svMatrixSet(SvMat *mat, int row, int col, FLT value) {
 	mat->data[sv_matrix_idx(mat, row, col)] = value;
 }
 
+static inline void sv_get_diag(const struct SvMat *m, FLT *v, size_t cnt) {
+	for (size_t i = 0; i < cnt; i++) {
+		v[i] = svMatrixGet(m, i, i);
+	}
+}
 static inline void sv_set_diag(struct SvMat *m, const FLT *v) {
 	for (int i = 0; i < m->rows; i++) {
 		for (int j = 0; j < m->cols; j++) {
@@ -295,6 +300,21 @@ static inline SvMat svMat_from_col_major(int rows, int cols, FLT *data) {
 	sv_col_major_to_internal(&rtn, data);
 	return rtn;
 }
+
+static inline void sv_elementwise_subtract(struct SvMat *dst, const struct SvMat *A, const struct SvMat *B) {
+	for (int i = 0; i < A->rows; i++) {
+		for (int j = 0; j < A->cols; j++) {
+			svMatrixSet(dst, i, j, svMatrixGet(A, i, j) - svMatrixGet(B, i, j));
+		}
+	}
+}
+
+#ifndef SV_MATRIX_IS_COL_MAJOR
+static inline SvMat sv_row(struct SvMat *M, int r) {
+	assert(r < M->rows);
+	return svMat(1, M->cols, M->data + M->step * r);
+}
+#endif
 
 #ifdef __cplusplus
 }
